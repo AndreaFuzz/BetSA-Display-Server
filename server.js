@@ -176,7 +176,9 @@ app.get('/set-url/:id', (req, res) => {
 
   res.send('OK');
 });
-
+app.get('/saved-urls', (req, res) => {
+  res.json(loadState());   // loadState() already returns {hdmi1, hdmi2}
+});
 /* ── start server & always open diagnostics first ─────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
