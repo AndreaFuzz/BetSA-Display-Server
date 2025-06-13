@@ -1,9 +1,10 @@
 {
   "name": "kiosk-server",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Dual-screen kiosk control server",
   "main": "server.js",
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "ejs": "^3.1.9"
   }
 }

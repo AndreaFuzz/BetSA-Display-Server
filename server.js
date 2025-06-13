@@ -1,4 +1,4 @@
-// server.js ─ BETSA kiosk helper with startup check & HTML diagnostics
+// server.js ─ BETSA kiosk helper with EJS diagnostics UI
 const express      = require('express');
 const fs           = require('fs');
 const { execSync, spawn } = require('child_process');
@@ -85,7 +85,7 @@ function getDiagnostics() {
   let model = 'unknown';
   try { model = fs.readFileSync('/proc/device-tree/model', 'utf8').trim(); } catch {}
   return {
-    time: new Date().toLocaleString(),
+    time: new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
     hostname: os.hostname(),
     arch: os.arch(),
     deviceModel: model,
@@ -95,6 +95,8 @@ function getDiagnostics() {
 
 // ── express app ──────────────────────────────────────────────────────────────
 const app = express();
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
 
 /* 1 ─ screenshot endpoint ─────────────────────────────────────────────────── */
 app.get('/screenshot/:id', (req, res) => {
@@ -120,35 +122,9 @@ app.get('/diagnostic', (req, res) => {
   res.json(getDiagnostics());
 });
 
-/* 3 ─ pretty HTML diagnostics page ─────────────────────────────────────────── */
+/* 3 ─ EJS diagnostics UI ───────────────────────────────────────────────────── */
 app.get('/diagnostic-ui', (req, res) => {
-  const d = getDiagnostics();
-  const rows = d.network.map(n =>
-    `<tr><td>${n.iface}</td><td>${n.ip}</td><td>${n.mac}</td></tr>`).join('');
-  res.send(`<!doctype html>
-    <html lang="en"><head><meta charset="utf-8">
-      <title>Device diagnostics</title>
-      <style>
-        body {margin:0;height:100vh;display:flex;justify-content:center;align-items:center;
-              background:#111;color:#fff;font-family:Arial,Helvetica,sans-serif;}
-        .wrap {text-align:center;font-size:24px;line-height:1.5;}
-        h1 {margin:0 0 0.5em 0;font-size:42px;}
-        table {margin:1em auto;border-collapse:collapse;font-size:22px;}
-        td,th {border:1px solid #555;padding:0.4em 0.8em;}
-        th {background:#222;}
-      </style>
-    </head><body>
-      <div class="wrap">
-        <h1>Device diagnostics</h1>
-        <div>Time&nbsp;&nbsp;${d.time}</div>
-        <div>Hostname&nbsp;&nbsp;${d.hostname}</div>
-        <div>Arch&nbsp;&nbsp;${d.arch}</div>
-        <div>Model&nbsp;&nbsp;${d.deviceModel}</div>
-        <h2 style="margin-top:1em;font-size:30px;">Network</h2>
-        <table><thead><tr><th>Interface</th><th>IP</th><th>MAC</th></tr></thead>
-          <tbody>${rows}</tbody></table>
-      </div>
-    </body></html>`);
+  res.render('diagnostic-ui', { d: getDiagnostics() });
 });
 
 /* 4 ─ set-URL & persistence ───────────────────────────────────────────────── */
