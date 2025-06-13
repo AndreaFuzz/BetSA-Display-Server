@@ -85,7 +85,7 @@ function getDiagnostics() {
   let model = 'unknown';
   try { model = fs.readFileSync('/proc/device-tree/model', 'utf8').trim(); } catch {}
   return {
-    time: new Date().toISOString(),
+    time: new Date().toLocaleString(),
     hostname: os.hostname(),
     arch: os.arch(),
     deviceModel: model,
