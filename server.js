@@ -150,7 +150,18 @@ app.get('/diagnostic', (req, res) => {
 app.get('/diagnostic-ui', (req, res) => {
   res.render('diagnostic-ui', { d: getDiagnostics() });
 });
-
+app.post('/reboot', (req, res) => {
+  res.send('Rebooting…');
+  try {
+    // give HTTP response a moment to flush
+    setTimeout(() => {
+      const { spawn } = require('child_process');
+      spawn('sudo', ['reboot'], { stdio: 'ignore', detached: true }).unref();
+    }, 100);
+  } catch (e) {
+    console.error('reboot failed', e);
+  }
+});
 /* 4 ─ set-URL & persistence ───────────────────────────────────────────────── */
 app.get('/set-url/:id', (req, res) => {
   const id  = req.params.id;
