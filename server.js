@@ -186,6 +186,40 @@ app.get('/set-url/:id', (req, res) => {
 app.get('/saved-urls', (req, res) => {
   res.json(loadState());   // loadState() already returns {hdmi1, hdmi2}
 });
+function ipv4Of(ifaceName = 'eth0') {
+  const nicArr = os.networkInterfaces()[ifaceName];
+  if (!nicArr) return null;
+  for (const n of nicArr) {
+    if (n.family === 'IPv4' && !n.internal) return n.address;
+  }
+  return null;
+}
+async function registerSelf() {
+  try {
+    
+    const ip = ipv4Of('eth0');          // returns null if eth0 missing / no IPv4
+    if (!ip) {
+      console.error('[register] eth0 not found or no IPv4 - skipping registration');
+      return;
+    }
+
+    const res = await fetch('http://10.1.220.203:7070/data', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ ip_eth0: ip })
+    });
+
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error(`[register] server replied ${res.status}: ${txt}`);
+    } else {
+      console.log(`[register] announced ${ip} to File-SD`);
+    }
+
+  } catch (err) {
+    console.error('[register] failed:', err.message || err);
+  }
+}
 /* ── start server & always open diagnostics first ─────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
@@ -195,4 +229,5 @@ app.listen(PORT, () => {
   // Always load diagnostics page first; it decides whether to redirect
   spawnBrowser('1', `${diagBase}?screen=1`);
   spawnBrowser('2', `${diagBase}?screen=2`);
+  registerSelf();
 });
