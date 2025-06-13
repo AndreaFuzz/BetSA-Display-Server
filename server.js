@@ -99,23 +99,47 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
 /* 1 ─ screenshot endpoint ─────────────────────────────────────────────────── */
+/* 1 ─ screenshot endpoint (now supports quality & max width) ─────────────── */
 app.get('/screenshot/:id', (req, res) => {
   const { w1, h1, w2, h2 } = readRes();
-  const id   = req.params.id;
-  const file = `/tmp/screen${id}.png`;
+  const id      = req.params.id;
+  const tmpPng  = `/tmp/screen${id}.png`;      // raw capture
+  const outFile = `/tmp/screen${id}.jpg`;      // final file we may send
+  const wantW   = parseInt(req.query.maxw, 10);   // NaN if missing
+  const wantQ   = parseInt(req.query.quality, 10); // NaN if missing
+
+  /* ---- grab the region --------------------------------------------------- */
   try {
     if (id === '1')
-      execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${file}`);
+      execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmpPng}`);
     else if (id === '2')
-      execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${file}`);
+      execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${tmpPng}`);
     else
       return res.status(400).send('invalid id');
-    res.type('png').send(fs.readFileSync(file));
   } catch (e) {
     console.error(e);
-    res.status(500).send('screen grab failed');
+    return res.status(500).send('screen grab failed');
+  }
+
+  /* ---- post-process if width/quality requested --------------------------- */
+  const needResize  = !Number.isNaN(wantW);
+  const needQuality = !Number.isNaN(wantQ);
+  if (needResize || needQuality) {
+    try {
+      const resizeOpt  = needResize  ? ` -resize ${wantW}` : '';
+      const qualityOpt = needQuality ? ` -quality ${wantQ}` : ' -quality 90';
+      execSync(`convert ${tmpPng}${resizeOpt}${qualityOpt} ${outFile}`);
+      res.type('jpeg').send(fs.readFileSync(outFile));
+    } catch (e) {
+      console.error('imagemagick convert failed', e);
+      return res.status(500).send('image conversion failed');
+    }
+  } else {
+    /* original behaviour: send full-size PNG */
+    res.type('png').send(fs.readFileSync(tmpPng));
   }
 });
+
 
 /* 2 ─ raw-JSON diagnostics (unchanged) ─────────────────────────────────────── */
 app.get('/diagnostic', (req, res) => {
