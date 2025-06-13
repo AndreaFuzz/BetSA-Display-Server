@@ -141,17 +141,24 @@ app.get('/diagnostic', (req, res) => {
   res.json(getDiagnostics());
 });
 
-/* 3 ─ diagnostics UI with optional redirect target ────────────────────────── */
+ 
+/* 3 ─ diagnostics UI with optional redirect target & saved URLs ──────────── */
 app.get('/diagnostic-ui', (req, res) => {
-  const state  = loadState();
-  const screen = req.query.screen;   // "1" or "2"
+  const state  = loadState();                  // { hdmi1, hdmi2 }
+  const screen = req.query.screen;             // "1" | "2" | undefined
   let target   = null;
 
   if (screen === '1')      target = state.hdmi1;
   else if (screen === '2') target = state.hdmi2;
 
-  res.render('diagnostic-ui', { d: getDiagnostics(), target, screen });
+  res.render('diagnostic-ui', {
+    d:   getDiagnostics(),
+    urls: state,          // pass both HDMI URLs to EJS
+    target,
+    screen
+  });
 });
+
 
 /* 4 ─ reboot endpoint ─────────────────────────────────────────────────────── */
 app.post('/reboot', (req, res) => {
