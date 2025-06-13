@@ -58,7 +58,7 @@ app.get('/set-url/:id', (req,res)=>{
   const pos  = (id==='2') ? `${w1},0`          : '0,0';
   const size = (id==='2') ? `${w2},${h2}`      : `${w1},${h1}`;
   const args = [
-    '--disable-gpu', '--noerrdialogs', '--disable-infobars',
+    '--no-sandbox', '--disable-gpu', '--noerrdialogs', '--disable-infobars',
     '--disable-session-crashed-bubble', '--start-fullscreen',
     `--app=${url}`, `--window-position=${pos}`, `--window-size=${size}`,
     `--user-data-dir=${profile}`
