@@ -95,6 +95,7 @@ function getDiagnostics() {
 
 // ── express + views ─────────────────────────────────────────────────────────
 const app = express();
+app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
@@ -185,6 +186,22 @@ app.get('/set-url/:id', (req, res) => {
 });
 app.get('/saved-urls', (req, res) => {
   res.json(loadState());   // loadState() already returns {hdmi1, hdmi2}
+});
+app.post('/saved-urls', (req, res) => {
+  /* expected JSON: { "hdmi1": "<url-or-null>", "hdmi2": "<url-or-null>" } */
+  const { hdmi1, hdmi2 } = req.body || {};
+
+  if (typeof hdmi1 !== 'string' && hdmi1 !== null && typeof hdmi1 !== 'undefined')
+    return res.status(400).send('hdmi1 must be string, null, or omitted');
+  if (typeof hdmi2 !== 'string' && hdmi2 !== null && typeof hdmi2 !== 'undefined')
+    return res.status(400).send('hdmi2 must be string, null, or omitted');
+
+  const state = loadState();
+  if (typeof hdmi1 !== 'undefined') state.hdmi1 = hdmi1;
+  if (typeof hdmi2 !== 'undefined') state.hdmi2 = hdmi2;
+  saveState(state);
+
+  res.json(state);                            // echo back new state
 });
 function ipv4Of(ifaceName = 'eth0') {
   const nicArr = os.networkInterfaces()[ifaceName];
