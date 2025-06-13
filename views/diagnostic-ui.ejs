@@ -6,11 +6,12 @@
   <style>
     body {margin:0;height:100vh;display:flex;justify-content:center;align-items:center;
           background:#111;color:#fff;font-family:Arial,Helvetica,sans-serif;}
-    .wrap {text-align:center;font-size:24px;line-height:1.5;}
+    .wrap {text-align:center;font-size:24px;line-height:1.5;position:relative;}
     h1 {margin:0 0 0.5em 0;font-size:42px;}
     table {margin:1em auto;border-collapse:collapse;font-size:22px;}
     td,th {border:1px solid #555;padding:0.4em 0.8em;}
     th {background:#222;}
+    #countdown {position:absolute;bottom:20px;width:100%;text-align:center;font-size:26px;}
   </style>
 </head>
 <body>
@@ -31,15 +32,37 @@
         <% }); %>
       </tbody>
     </table>
+
+    <% if (target) { %>
+      <div id="countdown">Redirecting in <span id="count">5</span>…</div>
+    <% } %>
   </div>
 
   <script>
+    // live clock
     function updateTime(){
       document.getElementById('time').textContent =
         new Date().toLocaleString('en-ZA', {timeZone:'Africa/Johannesburg'});
     }
     updateTime();
     setInterval(updateTime, 1000);
+
+    // optional redirect countdown
+    <% if (target) { %>
+      (function(){
+        let seconds = 5;
+        const span  = document.getElementById('count');
+        const url   = "<%= target %>";
+        const tick  = setInterval(() => {
+          seconds--;
+          span.textContent = seconds;
+          if(seconds === 0){
+            clearInterval(tick);
+            window.location.href = url;
+          }
+        }, 1000);
+      })();
+    <% } %>
   </script>
 </body>
 </html>

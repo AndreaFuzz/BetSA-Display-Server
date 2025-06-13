@@ -1,4 +1,4 @@
-// server.js ─ BETSA kiosk helper with EJS diagnostics UI
+// server.js ─ BETSA kiosk helper with EJS diagnostics UI & redirect countdown
 const express      = require('express');
 const fs           = require('fs');
 const { execSync, spawn } = require('child_process');
@@ -93,13 +93,12 @@ function getDiagnostics() {
   };
 }
 
-// ── express app ──────────────────────────────────────────────────────────────
+// ── express + views ─────────────────────────────────────────────────────────
 const app = express();
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-/* 1 ─ screenshot endpoint ─────────────────────────────────────────────────── */
-/* 1 ─ screenshot endpoint (now supports quality & max width) ─────────────── */
+/* 1 ─ screenshot endpoint (quality & max width) ───────────────────────────── */
 app.get('/screenshot/:id', (req, res) => {
   const { w1, h1, w2, h2 } = readRes();
   const id      = req.params.id;
@@ -108,7 +107,6 @@ app.get('/screenshot/:id', (req, res) => {
   const wantW   = parseInt(req.query.maxw, 10);   // NaN if missing
   const wantQ   = parseInt(req.query.quality, 10); // NaN if missing
 
-  /* ---- grab the region --------------------------------------------------- */
   try {
     if (id === '1')
       execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmpPng}`);
@@ -121,7 +119,6 @@ app.get('/screenshot/:id', (req, res) => {
     return res.status(500).send('screen grab failed');
   }
 
-  /* ---- post-process if width/quality requested --------------------------- */
   const needResize  = !Number.isNaN(wantW);
   const needQuality = !Number.isNaN(wantQ);
   if (needResize || needQuality) {
@@ -135,34 +132,36 @@ app.get('/screenshot/:id', (req, res) => {
       return res.status(500).send('image conversion failed');
     }
   } else {
-    /* original behaviour: send full-size PNG */
     res.type('png').send(fs.readFileSync(tmpPng));
   }
 });
 
-
-/* 2 ─ raw-JSON diagnostics (unchanged) ─────────────────────────────────────── */
+/* 2 ─ raw JSON diagnostics ────────────────────────────────────────────────── */
 app.get('/diagnostic', (req, res) => {
   res.json(getDiagnostics());
 });
 
-/* 3 ─ EJS diagnostics UI ───────────────────────────────────────────────────── */
+/* 3 ─ diagnostics UI with optional redirect target ────────────────────────── */
 app.get('/diagnostic-ui', (req, res) => {
-  res.render('diagnostic-ui', { d: getDiagnostics() });
+  const state  = loadState();
+  const screen = req.query.screen;   // "1" or "2"
+  let target   = null;
+
+  if (screen === '1')      target = state.hdmi1;
+  else if (screen === '2') target = state.hdmi2;
+
+  res.render('diagnostic-ui', { d: getDiagnostics(), target, screen });
 });
+
+/* 4 ─ reboot endpoint ─────────────────────────────────────────────────────── */
 app.post('/reboot', (req, res) => {
   res.send('Rebooting…');
-  try {
-    // give HTTP response a moment to flush
-    setTimeout(() => {
-      const { spawn } = require('child_process');
-      spawn('sudo', ['reboot'], { stdio: 'ignore', detached: true }).unref();
-    }, 100);
-  } catch (e) {
-    console.error('reboot failed', e);
-  }
+  setTimeout(() => {
+    spawn('sudo', ['reboot'], { stdio: 'ignore', detached: true }).unref();
+  }, 100);
 });
-/* 4 ─ set-URL & persistence ───────────────────────────────────────────────── */
+
+/* 5 ─ set-URL & persistence ───────────────────────────────────────────────── */
 app.get('/set-url/:id', (req, res) => {
   const id  = req.params.id;
   const url = req.query.url;
@@ -178,16 +177,13 @@ app.get('/set-url/:id', (req, res) => {
   res.send('OK');
 });
 
-/* ── start server & do power-on check ─────────────────────────────────────── */
+/* ── start server & always open diagnostics first ─────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
 
-  const state   = loadState();
-  const diagURL = `http://localhost:${PORT}/diagnostic-ui`;  // pretty page
+  const diagBase = `http://localhost:${PORT}/diagnostic-ui`;
 
-  const url1 = state.hdmi1 || diagURL;
-  const url2 = state.hdmi2 || diagURL;
-
-  spawnBrowser('1', url1);
-  spawnBrowser('2', url2);
+  // Always load diagnostics page first; it decides whether to redirect
+  spawnBrowser('1', `${diagBase}?screen=1`);
+  spawnBrowser('2', `${diagBase}?screen=2`);
 });
