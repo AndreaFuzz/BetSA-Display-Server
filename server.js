@@ -72,7 +72,45 @@ function saveState(state) {
   }
 }
 
+// ── helpers ──────────────────────────────────────────────────────────────────
 function getDiagnostics() {
+  // -------- device / platform model detection ------------------------------
+  function detectDeviceModel() {
+    // 1. Raspberry Pi (and most other ARM SBCs) expose a simple text file
+    //    that already works in your current codebase.
+    try {
+      const piModel = fs.readFileSync('/proc/device-tree/model', 'utf8').trim();
+      if (piModel.length) return piModel;
+    } catch { /* not a Pi or file missing */ }
+
+    // 2. Standard x86_64 / amd64 machines usually have DMI data.
+    //    We look at product name + (optionally) version + vendor.
+    const dmiBase = '/sys/devices/virtual/dmi/id';
+    try {
+      const product  = fs.readFileSync(path.join(dmiBase, 'product_name'  ), 'utf8').trim();
+      const version  = fs.readFileSync(path.join(dmiBase, 'product_version'), 'utf8').trim();
+      const vendor   = fs.readFileSync(path.join(dmiBase, 'sys_vendor'     ), 'utf8').trim();
+      const parts = [vendor, product, version].filter(Boolean);
+      if (parts.length) return parts.join(' ');
+    } catch { /* DMI not available (rare in VMs / locked-down systems) */ }
+
+    // 3. Fallback: ask `hostnamectl`, available on most modern Linux distros.
+    try {
+      const out = execSync('hostnamectl', { encoding: 'utf8' });
+      const m = out.match(/Hardware Model:\s+(.+)/);
+      if (m) return m[1].trim();
+    } catch { /* command missing or no permission */ }
+
+    // 4. Last resort – at least expose the CPU model so we never return "unknown".
+    try {
+      const cpuModel = (os.cpus()?.[0]?.model || '').trim();
+      if (cpuModel.length) return cpuModel;
+    } catch { /* extremely unlikely */ }
+
+    return 'unknown';
+  }
+
+  // --------------------------------------------------------------------------
   const nets = os.networkInterfaces();
   const ifaces = [];
   for (const [name, arr] of Object.entries(nets)) {
@@ -82,16 +120,16 @@ function getDiagnostics() {
       }
     }
   }
-  let model = 'unknown';
-  try { model = fs.readFileSync('/proc/device-tree/model', 'utf8').trim(); } catch {}
+
   return {
     time: new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
     hostname: os.hostname(),
-    arch: os.arch(),
-    deviceModel: model,
+    arch: os.arch(),                 // e.g. armv7l, aarch64, x64
+    deviceModel: detectDeviceModel(),// now never "unknown" on a properly configured box
     network: ifaces
   };
 }
+
 
 // ── express + views ─────────────────────────────────────────────────────────
 const app = express();
