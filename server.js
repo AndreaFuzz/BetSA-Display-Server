@@ -37,21 +37,23 @@ async function devToolsProbe() {
   '--remote-debugging-port=0',
   '--no-first-run', '--noerrdialogs',
   '--user-data-dir=' + probeDir,
+
+  // IMPORTANT flags copied from your kiosk launch:
   '--enable-gpu-rasterization',
   '--use-gl=egl',
+  '--use-angle=gles',        // ← tells ANGLE to use native GLES → V3D
   '--app=about:blank'
 ];
 
 // add --no-sandbox if running as root
-if (process.getuid && process.getuid() === 0) {
-  chromeArgs.splice(1, 0, '--no-sandbox');
-}
+if (process.getuid && process.getuid() === 0) chromeArgs.splice(1, 0, '--no-sandbox');
 
 const chrome = spawn(
   BROWSER_BIN,
   chromeArgs,
   { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
 );
+
 
   try {
     // 2 . catch “DevTools listening on ws://…”
