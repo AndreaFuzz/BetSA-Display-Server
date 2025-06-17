@@ -24,52 +24,63 @@ const BROWSER_BIN = (() => {
 
 /* ─────────────────────────  GPU-PROBE HELPERS  ─────────────────────────── */
 async function devToolsProbe() {
-  const probeDir = '/tmp/chrome-gpu-probe';
-  fs.rmSync(probeDir, { recursive: true, force: true });
+  const probeDir = require('fs').mkdtempSync('/tmp/chrome-gpu-');
 
+  // 1 . launch one-shot headless Chromium
   const chrome = spawn(
     BROWSER_BIN,
     [
       '--headless=new',
       '--remote-debugging-port=0',
-      '--no-first-run', '--no-sandbox', '--noerrdialogs',
+      '--no-first-run',
+      '--no-sandbox',
+      '--noerrdialogs',
       '--user-data-dir=' + probeDir,
-      '--enable-gpu-rasterization', '--use-gl=egl',
+      '--enable-gpu-rasterization',
+      '--use-gl=egl',
       'about:blank'
     ],
     { stdio: ['ignore', 'pipe', 'pipe'] }
   );
 
-  // 1 . Grab DevTools URL
-  const wsUrl = await new Promise((ok, fail) => {
-    const timer = setTimeout(() => fail(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
-    const scan = buf => {
-      const m = buf.toString().match(/DevTools listening on (ws:\/\/.*)/);
-      if (m) { clearTimeout(timer); ok(m[1].trim()); }
-    };
-    chrome.stdout.on('data', scan);
-    chrome.stderr.on('data', scan);
-  });
-
-  // 2 . Ask SystemInfo.getInfo
-  const raw = await new Promise((ok, fail) => {
-    const ws = new WebSocket(wsUrl);
-    const timer = setTimeout(() => fail(new Error('DevTools timeout')), DEVTOOLS_TIMEOUT);
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }));
+  try {
+    // 2 . catch “DevTools listening on ws://…”
+    const wsUrl = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
+      const scan = chunk => {
+        const m = chunk.toString().match(/DevTools listening on (ws:\/\/.*)/);
+        if (m) { clearTimeout(t); resolve(m[1].trim()); }
+      };
+      chrome.stdout.on('data', scan);
+      chrome.stderr.on('data', scan);
     });
-    ws.on('message', data => {
-      const msg = JSON.parse(data);
-      if (msg.id === 1) { clearTimeout(timer); ws.close(); ok(msg.result); }
-    });
-    ws.on('error', fail);
-  });
 
-  chrome.kill('SIGTERM');
-  fs.rmSync(probeDir, { recursive: true, force: true });
-  return raw;
+    // 3 . ask SystemInfo.getInfo over the socket
+    const raw = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      const t  = setTimeout(() => { ws.close(); reject(new Error('DevTools timeout')); },
+                            DEVTOOLS_TIMEOUT);
+
+      ws.on('open', () =>
+        ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }))
+      );
+
+      ws.on('message', data => {
+        const msg = JSON.parse(data);
+        if (msg.id === 1) { clearTimeout(t); ws.close(); resolve(msg.result); }
+      });
+
+      ws.on('error', err => { clearTimeout(t); reject(err); });
+    });
+
+    return raw; // full DevTools payload (same data chrome://gpu shows)
+  } finally {
+    // 4 . clean up regardless of success/failure
+    try { chrome.kill('SIGTERM'); } catch {}
+    try { require('fs').rmSync(probeDir, { recursive: true, force: true }); } catch {}
+  }
 }
+
 
 function summariseGpu(info) {
   const f = (info.gpu && info.gpu.featureStatus) || {};
