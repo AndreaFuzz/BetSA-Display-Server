@@ -28,20 +28,17 @@ async function devToolsProbe() {
 
   // 1 . launch one-shot headless Chromium
   const chrome = spawn(
-    BROWSER_BIN,
-    [
-      '--headless=new',
-      '--remote-debugging-port=0',
-      '--no-first-run',
-      '--no-sandbox',
-      '--noerrdialogs',
-      '--user-data-dir=' + probeDir,
-      '--enable-gpu-rasterization',
-      '--use-gl=egl',
-      'about:blank'
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  BROWSER_BIN,
+  [
+    '--remote-debugging-port=0',
+    '--no-first-run', '--noerrdialogs',
+    '--user-data-dir=' + probeDir,
+ 
+    '--enable-gpu-rasterization', '--use-gl=egl',
+    '--app=about:blank'
+  ],
+  { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
+);
 
   try {
     // 2 . catch “DevTools listening on ws://…”
