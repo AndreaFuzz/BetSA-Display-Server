@@ -1,13 +1,17 @@
 // server.js ─ BETSA kiosk helper with EJS diagnostics UI & redirect countdown
 const express      = require('express');
 const fs           = require('fs');
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
 const os           = require('os');
 const path         = require('path');
 
 const PORT        = 8080;
 const STATE_FILE  = '/home/pi/kiosk/urls.json';      // persistent store
 const PROFILE_DIR = '/home/pi/kiosk';                // per-screen chrome data
+
+ 
+const WebSocket = require('ws');
+const DEVTOOLS_TIMEOUT = 8000; 
 
 // ── locate chromium binary ───────────────────────────────────────────────────
 const BROWSER_BIN = (() => {
@@ -294,49 +298,58 @@ async function registerSelf() {
     console.error('[register] failed:', err.message || err);
   }
 }
-// ── GPU diagnostics ─────────────────────────────────────────────────────────
-const PROFILE_BASE = PROFILE_DIR;                    // already /home/pi/kiosk
+app.get('/gpu-info', async (req, res) => {
+  try {
+    // 1 . Launch throw-away headless Chromium
+    const probeDir = '/tmp/chrome-gpu-probe';
+    fs.rmSync(probeDir, { recursive: true, force: true });
 
-function getGpuInfo() {
-  /**
-   * Chromium writes hardware details into   <profile>/Local State
-   * under the key "gpu_info_cache".  We read both screen profiles
-   * (chrome1 and chrome2).  If one is missing we skip it.
-   */
-  function readOne(profile) {
-    try {
-      const raw = fs.readFileSync(
-        path.join(PROFILE_BASE, profile, 'Local State'),
-        'utf8'
-      );
-      const json = JSON.parse(raw).gpu_info_cache || {};
-      // tiny helper to make the dashboard easier to read
-      const summary = (() => {
-        const basic = json.basic_info || {};
-        return {
-          gl_renderer    : basic.gl_renderer        || 'n/a',
-          gl_vendor      : basic.gl_vendor          || 'n/a',
-          gl_version     : basic.gl_version         || 'n/a',
-          is_gpu_access  : basic.initialization_time_ms !== undefined,
-          video_decode   : (json.feature_status || {}).video_decode || 'n/a',
-          rasterization  : (json.feature_status || {}).rasterization || 'n/a',
-        };
-      })();
-      return { full: json, summary };
-    } catch (e) {
-      return { error: e.message || String(e) };
-    }
+    const chrome = spawnP(
+      BROWSER_BIN,
+      [
+        '--headless=new',
+        '--remote-debugging-port=0',          // 0 → pick free port & print to stdout
+        '--no-first-run', '--noerrdialogs',
+        '--user-data-dir=' + probeDir,
+        '--enable-gpu-rasterization',         // make sure GPU process spins up
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+
+    // 2 . Read “DevTools listening on …” line
+    const match = await new Promise((ok, fail) => {
+      const timer = setTimeout(() => fail(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
+      chrome.stdout.on('data', chunk => {
+        const m = chunk.toString().match(/DevTools listening on (ws:\/\/.*)/);
+        if (m) { clearTimeout(timer); ok(m[1].trim()); }
+      });
+      chrome.stderr.on('data', () => {});    // discard
+    });
+
+    // 3 . Connect & request SystemInfo.getInfo
+    const ws = new WebSocket(match);
+    const result = await new Promise((ok, fail) => {
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }));
+      });
+      ws.on('message', data => {
+        const msg = JSON.parse(data);
+        if (msg.id === 1) ok(msg.result);
+      });
+      ws.on('error', fail);
+      setTimeout(() => fail(new Error('DevTools timeout')), DEVTOOLS_TIMEOUT);
+    });
+
+    res.json(result);                        // <-- send to client
+  } catch (err) {
+    console.error('[gpu-info] probe failed:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    // 4 . Clean up
+    try { spawnSync('pkill', ['-f', 'chrome-gpu-probe']); } catch {}
+    fs.rmSync('/tmp/chrome-gpu-probe', { recursive: true, force: true });
   }
-
-  return {
-    chrome1: readOne('chrome1'),   // HDMI-1 profile
-    chrome2: readOne('chrome2'),   // HDMI-2 profile
-  };
-}
-
-// ── /gpu-info endpoint ──────────────────────────────────────────────────────
-app.get('/gpu-info', (req, res) => {
-  res.json(getGpuInfo());
 });
 
 /* ── start server & always open diagnostics first ─────────────────────────── */
