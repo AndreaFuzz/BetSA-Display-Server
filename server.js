@@ -15,18 +15,38 @@ const PROFILE_DIR = '/home/pi/kiosk';
 const DEVTOOLS_TIMEOUT = 8000;
 
  
-// ── locate chromium binary ────────────────────────────────────────────────
-const BROWSER_BIN = (() => {
-  // REAL binary first – bypass wrapper
-  const candidates = [
-    '/usr/lib/chromium-browser/chromium-browser', // Pi OS
-    '/usr/lib/chromium/chromium',                 // Debian/Ubuntu
-    'chromium', 'chromium-browser'                // fallback to wrapper
-  ];
-  for (const cmd of candidates) {
-    try { execSync(`command -v ${cmd}`); return cmd; } catch {}
+function resolveBinary(cmd) {
+  try {
+    // command -v prints the full path; trim() removes the newline
+    return execSync(`command -v ${cmd}`, { encoding: 'utf8' }).trim();
+  } catch {
+    return null;
   }
-  throw new Error('No chromium binary found - install "chromium"');
+}
+
+const BROWSER_BIN = (() => {
+  // honour manual override
+  if (process.env.KIOSK_CHROME_BIN) return process.env.KIOSK_CHROME_BIN;
+
+  //  common absolute paths first (no PATH lookup needed later)
+  const fixed = [
+    '/usr/lib/chromium-browser/chromium-browser', // Pi OS, old Ubuntu
+    '/usr/lib/chromium/chromium',                 // Debian/Ubuntu
+    '/usr/bin/chromium-browser',                  // newer Ubuntu
+    '/usr/bin/chromium',
+    '/snap/bin/chromium'                          // Snap package
+  ];
+  for (const p of fixed) {
+    try { fs.accessSync(p, fs.constants.X_OK); return p; } catch {}
+  }
+
+  // fall back to whatever “command -v” can find
+  return (
+    resolveBinary('chromium-browser') ||
+    resolveBinary('chromium')         ||
+    resolveBinary('google-chrome')    ||   // if you ever swap to Chrome
+    (() => { throw new Error('No chromium binary found'); })()
+  );
 })();
 
 /* ─────────────────────────  GPU-PROBE HELPERS  ─────────────────────────── */
