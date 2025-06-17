@@ -33,17 +33,23 @@ const BROWSER_BIN = (() => {
 async function devToolsProbe() {
   const probeDir = require('fs').mkdtempSync('/tmp/chrome-gpu-');
 
-  // 1 . launch one-shot headless Chromium
-  const chrome = spawn(
+  const chromeArgs = [
+  '--remote-debugging-port=0',
+  '--no-first-run', '--noerrdialogs',
+  '--user-data-dir=' + probeDir,
+  '--enable-gpu-rasterization',
+  '--use-gl=egl',
+  '--app=about:blank'
+];
+
+// add --no-sandbox if running as root
+if (process.getuid && process.getuid() === 0) {
+  chromeArgs.splice(1, 0, '--no-sandbox');
+}
+
+const chrome = spawn(
   BROWSER_BIN,
-  [
-    '--remote-debugging-port=0',
-    '--no-first-run', '--noerrdialogs',
-    '--user-data-dir=' + probeDir,
-    '--enable-gpu-rasterization',
-    '--use-gl=egl',
-    '--app=about:blank'
-  ],
+  chromeArgs,
   { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
 );
 
