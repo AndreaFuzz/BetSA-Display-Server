@@ -41,7 +41,7 @@ function spawnBrowser(id, url) {
   const size = id === '2' ? `${w2},${h2}` : `${w1},${h1}`;
   const args = [
     '--kiosk', '--no-sandbox', '--test-type',
-    '--disable-gpu', '--noerrdialogs', '--disable-infobars',
+    '--noerrdialogs', '--disable-infobars',
     '--disable-session-crashed-bubble', '--start-fullscreen',
     `--app=${url}`,
     `--window-position=${pos}`, `--window-size=${size}`,
