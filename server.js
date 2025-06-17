@@ -169,7 +169,7 @@ function spawnBrowser(id, url) {
     `--window-position=${pos}`, `--window-size=${size}`,
     `--user-data-dir=${profile}`
   ];
-  
+   
 
   const child = spawn(BROWSER_BIN, args, {
     env: { DISPLAY: ':0' },
