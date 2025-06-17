@@ -294,6 +294,51 @@ async function registerSelf() {
     console.error('[register] failed:', err.message || err);
   }
 }
+// ── GPU diagnostics ─────────────────────────────────────────────────────────
+const PROFILE_BASE = PROFILE_DIR;                    // already /home/pi/kiosk
+
+function getGpuInfo() {
+  /**
+   * Chromium writes hardware details into   <profile>/Local State
+   * under the key "gpu_info_cache".  We read both screen profiles
+   * (chrome1 and chrome2).  If one is missing we skip it.
+   */
+  function readOne(profile) {
+    try {
+      const raw = fs.readFileSync(
+        path.join(PROFILE_BASE, profile, 'Local State'),
+        'utf8'
+      );
+      const json = JSON.parse(raw).gpu_info_cache || {};
+      // tiny helper to make the dashboard easier to read
+      const summary = (() => {
+        const basic = json.basic_info || {};
+        return {
+          gl_renderer    : basic.gl_renderer        || 'n/a',
+          gl_vendor      : basic.gl_vendor          || 'n/a',
+          gl_version     : basic.gl_version         || 'n/a',
+          is_gpu_access  : basic.initialization_time_ms !== undefined,
+          video_decode   : (json.feature_status || {}).video_decode || 'n/a',
+          rasterization  : (json.feature_status || {}).rasterization || 'n/a',
+        };
+      })();
+      return { full: json, summary };
+    } catch (e) {
+      return { error: e.message || String(e) };
+    }
+  }
+
+  return {
+    chrome1: readOne('chrome1'),   // HDMI-1 profile
+    chrome2: readOne('chrome2'),   // HDMI-2 profile
+  };
+}
+
+// ── /gpu-info endpoint ──────────────────────────────────────────────────────
+app.get('/gpu-info', (req, res) => {
+  res.json(getGpuInfo());
+});
+
 /* ── start server & always open diagnostics first ─────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
