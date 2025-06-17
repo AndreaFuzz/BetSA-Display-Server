@@ -304,7 +304,7 @@ app.get('/gpu-info', async (req, res) => {
     const probeDir = '/tmp/chrome-gpu-probe';
     fs.rmSync(probeDir, { recursive: true, force: true });
 
-    const chrome = spawnP(
+    const chrome = spawn(
       BROWSER_BIN,
       [
         '--headless=new',
