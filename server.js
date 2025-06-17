@@ -1,45 +1,104 @@
-// server.js ─ BETSA kiosk helper with EJS diagnostics UI & redirect countdown
-const express      = require('express');
-const fs           = require('fs');
+// server.js — BETSA kiosk helper with EJS diagnostics UI & redirect countdown
+// ----------------------------------------------------------------------------
+const express = require('express');
+const fs = require('fs');
 const { execSync, spawn, spawnSync } = require('child_process');
-const os           = require('os');
-const path         = require('path');
-
-const PORT        = 8080;
-const STATE_FILE  = '/home/pi/kiosk/urls.json';      // persistent store
-const PROFILE_DIR = '/home/pi/kiosk';                // per-screen chrome data
-
- 
+const os = require('os');
+const path = require('path');
 const WebSocket = require('ws');
-const DEVTOOLS_TIMEOUT = 8000; 
+// lightweight fetch in CommonJS
+const fetch = (...a) => import('node-fetch').then(m => m.default(...a));
 
-// ── locate chromium binary ───────────────────────────────────────────────────
+const PORT = 8080;
+const STATE_FILE = '/home/pi/kiosk/urls.json';
+const PROFILE_DIR = '/home/pi/kiosk';
+const DEVTOOLS_TIMEOUT = 8000;
+
+/* ── locate chromium binary ─────────────────────────────────────────────── */
 const BROWSER_BIN = (() => {
   for (const cmd of ['chromium-browser', 'chromium']) {
-    try { execSync(`command -v ${cmd}`); return cmd; } catch {}
+    try { execSync(`command -v ${cmd}`); return cmd; } catch { }
   }
   throw new Error('No chromium binary found – install "chromium"');
 })();
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+/* ─────────────────────────  GPU-PROBE HELPERS  ─────────────────────────── */
+async function devToolsProbe() {
+  const probeDir = '/tmp/chrome-gpu-probe';
+  fs.rmSync(probeDir, { recursive: true, force: true });
+
+  const chrome = spawn(
+    BROWSER_BIN,
+    [
+      '--headless=new',
+      '--remote-debugging-port=0',
+      '--no-first-run', '--no-sandbox', '--noerrdialogs',
+      '--user-data-dir=' + probeDir,
+      '--enable-gpu-rasterization', '--use-gl=egl',
+      'about:blank'
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+
+  // 1 . Grab DevTools URL
+  const wsUrl = await new Promise((ok, fail) => {
+    const timer = setTimeout(() => fail(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
+    const scan = buf => {
+      const m = buf.toString().match(/DevTools listening on (ws:\/\/.*)/);
+      if (m) { clearTimeout(timer); ok(m[1].trim()); }
+    };
+    chrome.stdout.on('data', scan);
+    chrome.stderr.on('data', scan);
+  });
+
+  // 2 . Ask SystemInfo.getInfo
+  const raw = await new Promise((ok, fail) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => fail(new Error('DevTools timeout')), DEVTOOLS_TIMEOUT);
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }));
+    });
+    ws.on('message', data => {
+      const msg = JSON.parse(data);
+      if (msg.id === 1) { clearTimeout(timer); ws.close(); ok(msg.result); }
+    });
+    ws.on('error', fail);
+  });
+
+  chrome.kill('SIGTERM');
+  fs.rmSync(probeDir, { recursive: true, force: true });
+  return raw;
+}
+
+function summariseGpu(info) {
+  const f = (info.gpu && info.gpu.featureStatus) || {};
+  return {
+    videoDecode: f.videoDecode || 'unknown',
+    rasterization: f.rasterization || 'unknown',
+    gpuEnabled: /hardware|enabled/i.test(f.videoDecode) ||
+                /hardware|enabled/i.test(f.rasterization)
+  };
+}
+/* ───────────────────────────────────────────────────────────────────────── */
+
+/* ── UTILITY HELPERS  (unchanged from your original) ─────────────────────── */
 function readRes() {
   try {
-    const xr = execSync('xrandr --current', { env:{ DISPLAY:':0' } }).toString();
+    const xr = execSync('xrandr --current', { env: { DISPLAY: ':0' } }).toString();
     const m1 = xr.match(/HDMI-1 connected.*? (\d+)x(\d+)/);
     const m2 = xr.match(/HDMI-2 connected.*? (\d+)x(\d+)/);
     return {
       w1: m1 ? +m1[1] : 0, h1: m1 ? +m1[2] : 0,
-      w2: m2 ? +m2[1] : 0, h2: m2 ? +m2[2] : 0,
+      w2: m2 ? +m2[1] : 0, h2: m2 ? +m2[2] : 0
     };
-  } catch {
-    return { w1:0, h1:0, w2:0, h2:0 };
-  }
+  } catch { return { w1: 0, h1: 0, w2: 0, h2: 0 }; }
 }
 
 function spawnBrowser(id, url) {
   const { w1, h1, w2, h2 } = readRes();
   const profile = path.join(PROFILE_DIR, `chrome${id}`);
-  try { execSync(`pkill -f -- "--user-data-dir=${profile}"`); } catch {}
+  try { execSync(`pkill -f -- "--user-data-dir=${profile}"`); } catch { }
 
   const pos  = id === '2' ? `${w1},0` : '0,0';
   const size = id === '2' ? `${w2},${h2}` : `${w1},${h1}`;
@@ -53,7 +112,7 @@ function spawnBrowser(id, url) {
   ];
 
   const child = spawn(BROWSER_BIN, args, {
-    env: { DISPLAY:':0' },
+    env: { DISPLAY: ':0' },
     detached: true,
     stdio: 'ignore'
   });
@@ -71,50 +130,35 @@ function saveState(state) {
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    console.error('Could not write state file:', e);
-  }
+  } catch (e) { console.error('Could not write state file:', e); }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
 function getDiagnostics() {
-  // -------- device / platform model detection ------------------------------
   function detectDeviceModel() {
-    // 1. Raspberry Pi (and most other ARM SBCs) expose a simple text file
-    //    that already works in your current codebase.
     try {
       const piModel = fs.readFileSync('/proc/device-tree/model', 'utf8').trim();
       if (piModel.length) return piModel;
-    } catch { /* not a Pi or file missing */ }
-
-    // 2. Standard x86_64 / amd64 machines usually have DMI data.
-    //    We look at product name + (optionally) version + vendor.
-    const dmiBase = '/sys/devices/virtual/dmi/id';
+    } catch { }
+    const dmi = '/sys/devices/virtual/dmi/id';
     try {
-      const product  = fs.readFileSync(path.join(dmiBase, 'product_name'  ), 'utf8').trim();
-      const version  = fs.readFileSync(path.join(dmiBase, 'product_version'), 'utf8').trim();
-      const vendor   = fs.readFileSync(path.join(dmiBase, 'sys_vendor'     ), 'utf8').trim();
-      const parts = [vendor, product, version].filter(Boolean);
+      const prod = fs.readFileSync(path.join(dmi, 'product_name'), 'utf8').trim();
+      const ver = fs.readFileSync(path.join(dmi, 'product_version'), 'utf8').trim();
+      const ven = fs.readFileSync(path.join(dmi, 'sys_vendor'), 'utf8').trim();
+      const parts = [ven, prod, ver].filter(Boolean);
       if (parts.length) return parts.join(' ');
-    } catch { /* DMI not available (rare in VMs / locked-down systems) */ }
-
-    // 3. Fallback: ask `hostnamectl`, available on most modern Linux distros.
+    } catch { }
     try {
       const out = execSync('hostnamectl', { encoding: 'utf8' });
       const m = out.match(/Hardware Model:\s+(.+)/);
       if (m) return m[1].trim();
-    } catch { /* command missing or no permission */ }
-
-    // 4. Last resort – at least expose the CPU model so we never return "unknown".
+    } catch { }
     try {
-      const cpuModel = (os.cpus()?.[0]?.model || '').trim();
-      if (cpuModel.length) return cpuModel;
-    } catch { /* extremely unlikely */ }
-
+      const cpu = (os.cpus()?.[0]?.model || '').trim();
+      if (cpu.length) return cpu;
+    } catch { }
     return 'unknown';
   }
 
-  // --------------------------------------------------------------------------
   const nets = os.networkInterfaces();
   const ifaces = [];
   for (const [name, arr] of Object.entries(nets)) {
@@ -128,82 +172,99 @@ function getDiagnostics() {
   return {
     time: new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
     hostname: os.hostname(),
-    arch: os.arch(),                 // e.g. armv7l, aarch64, x64
-    deviceModel: detectDeviceModel(),// now never "unknown" on a properly configured box
+    arch: os.arch(),
+    deviceModel: detectDeviceModel(),
     network: ifaces
   };
 }
 
+function ipv4Of(iface = 'eth0') {
+  const nicArr = os.networkInterfaces()[iface];
+  if (!nicArr) return null;
+  for (const n of nicArr) if (n.family === 'IPv4' && !n.internal) return n.address;
+  return null;
+}
 
-// ── express + views ─────────────────────────────────────────────────────────
+async function registerSelf() {
+  try {
+    const ip = ipv4Of('eth0');
+    if (!ip) return console.error('[register] eth0 missing/no IPv4');
+    await fetch('http://10.1.220.203:7070/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ip_eth0: ip })
+    });
+    console.log(`[register] announced ${ip} to File-SD`);
+  } catch (e) {
+    console.error('[register] failed:', e.message);
+  }
+}
+
+/* ── EXPRESS SETUP & ROUTES ─────────────────────────────────────────────── */
 const app = express();
 app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-/* 1 ─ screenshot endpoint (quality & max width) ───────────────────────────── */
+/* 1 screenshot endpoint --------------------------------------------------- */
 app.get('/screenshot/:id', (req, res) => {
   const { w1, h1, w2, h2 } = readRes();
-  const id      = req.params.id;
-  const tmpPng  = `/tmp/screen${id}.png`;      // raw capture
-  const outFile = `/tmp/screen${id}.jpg`;      // final file we may send
-  const wantW   = parseInt(req.query.maxw, 10);   // NaN if missing
-  const wantQ   = parseInt(req.query.quality, 10); // NaN if missing
+  const id = req.params.id;
+  const tmp = `/tmp/screen${id}.png`;
+  const out = `/tmp/screen${id}.jpg`;
+  const wantW = parseInt(req.query.maxw, 10);
+  const wantQ = parseInt(req.query.quality, 10);
 
   try {
-    if (id === '1')
-      execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmpPng}`);
-    else if (id === '2')
-      execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${tmpPng}`);
-    else
-      return res.status(400).send('invalid id');
+    if (id === '1') execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmp}`);
+    else if (id === '2') execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${tmp}`);
+    else return res.status(400).send('invalid id');
   } catch (e) {
-    console.error(e);
-    return res.status(500).send('screen grab failed');
+    console.error(e); return res.status(500).send('screen grab failed');
   }
 
-  const needResize  = !Number.isNaN(wantW);
+  const needResize = !Number.isNaN(wantW);
   const needQuality = !Number.isNaN(wantQ);
   if (needResize || needQuality) {
     try {
-      const resizeOpt  = needResize  ? ` -resize ${wantW}` : '';
+      const resizeOpt = needResize ? ` -resize ${wantW}` : '';
       const qualityOpt = needQuality ? ` -quality ${wantQ}` : ' -quality 90';
-      execSync(`convert ${tmpPng}${resizeOpt}${qualityOpt} ${outFile}`);
-      res.type('jpeg').send(fs.readFileSync(outFile));
+      execSync(`convert ${tmp}${resizeOpt}${qualityOpt} ${out}`);
+      res.type('jpeg').send(fs.readFileSync(out));
     } catch (e) {
-      console.error('imagemagick convert failed', e);
+      console.error('convert failed', e);
       return res.status(500).send('image conversion failed');
     }
   } else {
-    res.type('png').send(fs.readFileSync(tmpPng));
+    res.type('png').send(fs.readFileSync(tmp));
   }
 });
 
-/* 2 ─ raw JSON diagnostics ────────────────────────────────────────────────── */
+/* 2 simple diagnostics ---------------------------------------------------- */
 app.get('/diagnostic', (req, res) => {
-  res.json(getDiagnostics());
+   res.json(getDiagnostics());
 });
 
- 
-/* 3 ─ diagnostics UI with optional redirect target & saved URLs ──────────── */
-app.get('/diagnostic-ui', (req, res) => {
-  const state  = loadState();                  // { hdmi1, hdmi2 }
-  const screen = req.query.screen;             // "1" | "2" | undefined
-  let target   = null;
+/* 3 diagnostics UI (adds GPU summary) ------------------------------------- */
+app.get('/diagnostic-ui', async (req, res) => {
+  const state = loadState();
+  const screen = req.query.screen;
+  const target = screen === '1' ? state.hdmi1
+    : screen === '2' ? state.hdmi2 : null;
 
-  if (screen === '1')      target = state.hdmi1;
-  else if (screen === '2') target = state.hdmi2;
+  let gpu = null;
+  try { gpu = summariseGpu(await devToolsProbe()); }
+  catch (e) { console.error('[gpu probe] failed:', e.message); }
 
   res.render('diagnostic-ui', {
-    d:   getDiagnostics(),
-    urls: state,          // pass both HDMI URLs to EJS
-    target,
-    screen
+    d: getDiagnostics(),
+    gpu: gpu,
+    urls: state,
+    target, screen
   });
 });
 
-
-/* 4 ─ reboot endpoint ─────────────────────────────────────────────────────── */
+/* 4 reboot --------------------------------------------------------------- */
 app.post('/reboot', (req, res) => {
   res.send('Rebooting…');
   setTimeout(() => {
@@ -211,154 +272,55 @@ app.post('/reboot', (req, res) => {
   }, 100);
 });
 
-/* 5 ─ set-URL & persistence ───────────────────────────────────────────────── */
+/* 5 URL management -------------------------------------------------------- */
 app.get('/set-url/:id', (req, res) => {
-  const id  = req.params.id;
-  const url = req.query.url;
+  const id = req.params.id; const url = req.query.url;
   if (!url) return res.status(400).send('missing url');
   if (id !== '1' && id !== '2') return res.status(400).send('invalid id');
 
   spawnBrowser(id, url);
-
-  const state = loadState();
-  if (id === '1') state.hdmi1 = url; else state.hdmi2 = url;
-  saveState(state);
-
-  res.send('OK');
+  const state = loadState(); if (id === '1') state.hdmi1 = url; else state.hdmi2 = url;
+  saveState(state); res.send('OK');
 });
-/* ── saved-urls: GET returns state, POST updates AND refreshes chromes ───── */
-app.get('/saved-urls', (req, res) => {
-  res.json(loadState());                       // { hdmi1, hdmi2 }
-});
-
+app.get('/saved-urls', (req, res) => { res.json(loadState()); });
 app.post('/saved-urls', (req, res) => {
-  /* expected JSON: { "hdmi1": "<url-or-null>", "hdmi2": "<url-or-null>" } */
   const { hdmi1, hdmi2 } = req.body || {};
-
-  // quick type guards
-  const okType = v => typeof v === 'string' || v === null || typeof v === 'undefined';
-  if (!okType(hdmi1) || !okType(hdmi2))
-    return res.status(400).send('hdmi1/hdmi2 must be string, null, or omitted');
+  const ok = v => typeof v === 'string' || v === null || typeof v === 'undefined';
+  if (!ok(hdmi1) || !ok(hdmi2)) return res.status(400).send('hdmi1/hdmi2 bad');
 
   const state = loadState();
-
-  /* ── HDMI-1 ────────────────────────────────────────────────────────────── */
   if (typeof hdmi1 !== 'undefined') {
     state.hdmi1 = hdmi1;
     if (typeof hdmi1 === 'string' && hdmi1.length) {
       spawnBrowser('1', hdmi1);                // refresh screen 1
     }
-    // if hdmi1 === null we leave screen 1 on whatever it was
-    // (add a pkill here if you want to blank it)
   }
-
-  /* ── HDMI-2 ────────────────────────────────────────────────────────────── */
   if (typeof hdmi2 !== 'undefined') {
     state.hdmi2 = hdmi2;
     if (typeof hdmi2 === 'string' && hdmi2.length) {
       spawnBrowser('2', hdmi2);                // refresh screen 2
     }
   }
-
-  saveState(state);
-  res.json(state);                             // echo back new state
+  saveState(state); 
+  res.json(state);
 });
 
-function ipv4Of(ifaceName = 'eth0') {
-  const nicArr = os.networkInterfaces()[ifaceName];
-  if (!nicArr) return null;
-  for (const n of nicArr) {
-    if (n.family === 'IPv4' && !n.internal) return n.address;
-  }
-  return null;
-}
-async function registerSelf() {
-  try {
-    
-    const ip = ipv4Of('eth0');          // returns null if eth0 missing / no IPv4
-    if (!ip) {
-      console.error('[register] eth0 not found or no IPv4 - skipping registration');
-      return;
-    }
-
-    const res = await fetch('http://10.1.220.203:7070/data', {
-      method : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify({ ip_eth0: ip })
-    });
-
-    if (!res.ok) {
-      const txt = await res.text();
-      console.error(`[register] server replied ${res.status}: ${txt}`);
-    } else {
-      console.log(`[register] announced ${ip} to File-SD`);
-    }
-
-  } catch (err) {
-    console.error('[register] failed:', err.message || err);
-  }
-}
+/* 6 GPU info API ---------------------------------------------------------- */
 app.get('/gpu-info', async (req, res) => {
   try {
-    // 1 . Launch throw-away headless Chromium
-    const probeDir = '/tmp/chrome-gpu-probe';
-    fs.rmSync(probeDir, { recursive: true, force: true });
-
-    const chrome = spawn(
-      BROWSER_BIN,
-      [
-        '--headless=new',
-        '--remote-debugging-port=0',          // 0 → pick free port & print to stdout
-        '--no-first-run', '--noerrdialogs',
-        '--user-data-dir=' + probeDir,
-        '--enable-gpu-rasterization',         // make sure GPU process spins up
-        'about:blank'
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-
-    // 2 . Read “DevTools listening on …” line
-    const match = await new Promise((ok, fail) => {
-      const timer = setTimeout(() => fail(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
-      chrome.stdout.on('data', chunk => {
-        const m = chunk.toString().match(/DevTools listening on (ws:\/\/.*)/);
-        if (m) { clearTimeout(timer); ok(m[1].trim()); }
-      });
-      chrome.stderr.on('data', () => {});    // discard
-    });
-
-    // 3 . Connect & request SystemInfo.getInfo
-    const ws = new WebSocket(match);
-    const result = await new Promise((ok, fail) => {
-      ws.on('open', () => {
-        ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }));
-      });
-      ws.on('message', data => {
-        const msg = JSON.parse(data);
-        if (msg.id === 1) ok(msg.result);
-      });
-      ws.on('error', fail);
-      setTimeout(() => fail(new Error('DevTools timeout')), DEVTOOLS_TIMEOUT);
-    });
-
-    res.json(result);                        // <-- send to client
+    const raw = await devToolsProbe();
+    res.json({ summary: summariseGpu(raw), raw });
   } catch (err) {
-    console.error('[gpu-info] probe failed:', err);
+    console.error('[gpu-info] probe failed:', err.message);
+    try { spawnSync('pkill', ['-f', 'chrome-gpu-probe']); } catch { }
     res.status(500).json({ error: err.message });
-  } finally {
-    // 4 . Clean up
-    try { spawnSync('pkill', ['-f', 'chrome-gpu-probe']); } catch {}
-    fs.rmSync('/tmp/chrome-gpu-probe', { recursive: true, force: true });
   }
 });
 
-/* ── start server & always open diagnostics first ─────────────────────────── */
+/* ── START SERVER ───────────────────────────────────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
-
   const diagBase = `http://localhost:${PORT}/diagnostic-ui`;
-
-  // Always load diagnostics page first; it decides whether to redirect
   spawnBrowser('1', `${diagBase}?screen=1`);
   spawnBrowser('2', `${diagBase}?screen=2`);
   registerSelf();
