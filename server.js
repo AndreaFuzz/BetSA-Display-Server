@@ -14,12 +14,19 @@ const STATE_FILE = '/home/pi/kiosk/urls.json';
 const PROFILE_DIR = '/home/pi/kiosk';
 const DEVTOOLS_TIMEOUT = 8000;
 
-/* ── locate chromium binary ─────────────────────────────────────────────── */
+ 
+// ── locate chromium binary ────────────────────────────────────────────────
 const BROWSER_BIN = (() => {
-  for (const cmd of ['chromium-browser', 'chromium']) {
-    try { execSync(`command -v ${cmd}`); return cmd; } catch { }
+  // REAL binary first – bypass wrapper
+  const candidates = [
+    '/usr/lib/chromium-browser/chromium-browser', // Pi OS
+    '/usr/lib/chromium/chromium',                 // Debian/Ubuntu
+    'chromium', 'chromium-browser'                // fallback to wrapper
+  ];
+  for (const cmd of candidates) {
+    try { execSync(`command -v ${cmd}`); return cmd; } catch {}
   }
-  throw new Error('No chromium binary found – install "chromium"');
+  throw new Error('No chromium binary found - install "chromium"');
 })();
 
 /* ─────────────────────────  GPU-PROBE HELPERS  ─────────────────────────── */
@@ -33,8 +40,8 @@ async function devToolsProbe() {
     '--remote-debugging-port=0',
     '--no-first-run', '--noerrdialogs',
     '--user-data-dir=' + probeDir,
- 
-    '--enable-gpu-rasterization', '--use-gl=egl',
+    '--enable-gpu-rasterization',
+    '--use-gl=egl',
     '--app=about:blank'
   ],
   { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
