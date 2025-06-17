@@ -34,25 +34,36 @@ async function devToolsProbe() {
   const probeDir = require('fs').mkdtempSync('/tmp/chrome-gpu-');
 
   const chromeArgs = [
+  // DevTools on a random port
   '--remote-debugging-port=0',
-  '--no-first-run', '--noerrdialogs',
+
+  // allow root without sandbox *and* keep GPU enabled
+  '--no-sandbox',
+  '--test-type',
+
+  // suppress first-run noise
+  '--no-first-run',
+  '--noerrdialogs',
+
+  // throw-away profile
   '--user-data-dir=' + probeDir,
 
-  // IMPORTANT flags copied from your kiosk launch:
+  // make ANGLE talk to V3D
   '--enable-gpu-rasterization',
+  '--use-angle=gles',
   '--use-gl=egl',
-  '--use-angle=gles',        // ← tells ANGLE to use native GLES → V3D
+  '--disable-software-rasterizer',
+
+  // minimal UI window (not headless)
   '--app=about:blank'
 ];
-
-// add --no-sandbox if running as root
-if (process.getuid && process.getuid() === 0) chromeArgs.splice(1, 0, '--no-sandbox');
 
 const chrome = spawn(
   BROWSER_BIN,
   chromeArgs,
   { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
 );
+
 
 
   try {
