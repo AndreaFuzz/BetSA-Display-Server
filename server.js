@@ -157,13 +157,19 @@ function spawnBrowser(id, url) {
   const pos  = id === '2' ? `${w1},0` : '0,0';
   const size = id === '2' ? `${w2},${h2}` : `${w1},${h1}`;
   const args = [
-    '--kiosk', '--no-sandbox', '--test-type',
+    '--kiosk',
+    '--use-gl=egl',
+    '--enable-gpu-rasterization',
+    '--ignore-gpu-blocklist',
+    '--autoplay-policy=no-user-gesture-required',
+    '--no-sandbox','--test-type',
     '--noerrdialogs', '--disable-infobars',
-    '--disable-session-crashed-bubble', '--start-fullscreen',
+    '--disable-session-crashed-bubble',
     `--app=${url}`,
     `--window-position=${pos}`, `--window-size=${size}`,
     `--user-data-dir=${profile}`
   ];
+  
 
   const child = spawn(BROWSER_BIN, args, {
     env: { DISPLAY: ':0' },
