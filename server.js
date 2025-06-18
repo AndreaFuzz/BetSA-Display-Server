@@ -291,7 +291,7 @@ function ipv4Of (iface = 'eth0') {
   const nicArr = os.networkInterfaces()[iface];
   return nicArr?.find(n => n.family === 'IPv4' && !n.internal)?.address || null;
 }
-
+ 
 async function registerSelf () {
   try {
     const ip = ipv4Of('eth0');
