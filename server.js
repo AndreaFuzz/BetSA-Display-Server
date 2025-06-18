@@ -11,7 +11,7 @@ const WebSocket    = require('ws');
 const fetch        = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 const PORT        = 8080;                       // HTTP API / UI port
-const STATE_FILE  = '/home/pi/kiosk/urls.json'; // persistent store for HDMI URLs
+const STATE_FILE  = '/home/admin/kiosk/urls.json'; // persistent store for HDMI URLs
 
 /* ─────────────────── DevTools auto-reconnect controller ────────────────── */
 
