@@ -1,186 +1,73 @@
-// server.js — BETSA kiosk helper with EJS diagnostics UI & redirect countdown
-// ----------------------------------------------------------------------------
-const express = require('express');
-const fs = require('fs');
-const { execSync, spawn, spawnSync } = require('child_process');
-const os = require('os');
-const path = require('path');
-const WebSocket = require('ws');
-// lightweight fetch in CommonJS
-const fetch = (...a) => import('node-fetch').then(m => m.default(...a));
+// server.js ─ BETSA kiosk helper with EJS diagnostics UI & redirect countdown
+/* eslint-disable no-console */
 
-const PORT = 8080;
-const STATE_FILE = '/home/pi/kiosk/urls.json';
-const PROFILE_DIR = '/home/pi/kiosk';
-const DEVTOOLS_TIMEOUT = 8000;
+const express      = require('express');
+const fs           = require('fs');
+const { execSync, spawn } = require('child_process');
+const os           = require('os');
+const path         = require('path');
+const http         = require('http');
+const WebSocket    = require('ws');             // DevTools WS
+const fetch        = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
- 
-function resolveBinary(cmd) {
-  try {
-    // command -v prints the full path; trim() removes the newline
-    return execSync(`command -v ${cmd}`, { encoding: 'utf8' }).trim();
-  } catch {
-    return null;
-  }
-}
+const PORT        = 8080;                       // HTTP API / UI port
+const STATE_FILE  = '/home/pi/kiosk/urls.json'; // persistent store for HDMI URLs
+const PROFILE_DIR = '/home/pi/kiosk';           // (unused here but kept)
 
-const BROWSER_BIN = (() => {
-  // honour manual override
-  if (process.env.KIOSK_CHROME_BIN) return process.env.KIOSK_CHROME_BIN;
+/* ──────────────────────────── DevTools helpers ─────────────────────────── */
+/* HDMI-1 → port 9222  |  HDMI-2 → port 9223 */
+const SCREEN_PORT = { '1': 9222, '2': 9223 };
 
-  //  common absolute paths first (no PATH lookup needed later)
-  const fixed = [
-    '/usr/lib/chromium-browser/chromium-browser', // Pi OS, old Ubuntu
-    '/usr/lib/chromium/chromium',                 // Debian/Ubuntu
-    '/usr/bin/chromium-browser',                  // newer Ubuntu
-    '/usr/bin/chromium',
-    '/snap/bin/chromium'                          // Snap package
-  ];
-  for (const p of fixed) {
-    try { fs.accessSync(p, fs.constants.X_OK); return p; } catch {}
-  }
-
-  // fall back to whatever “command -v” can find
-  return (
-    resolveBinary('chromium-browser') ||
-    resolveBinary('chromium')         ||
-    resolveBinary('google-chrome')    ||   // if you ever swap to Chrome
-    (() => { throw new Error('No chromium binary found'); })()
-  );
-})();
-
-/* ─────────────────────────  GPU-PROBE HELPERS  ─────────────────────────── */
-async function devToolsProbe() {
-  const probeDir = require('fs').mkdtempSync('/tmp/chrome-gpu-');
-
-  const chromeArgs = [
-  // DevTools on a random port
-  '--remote-debugging-port=0',
-
-  // allow root without sandbox *and* keep GPU enabled
-  '--no-sandbox',
-  '--test-type',
-
-  // suppress first-run noise
-  '--no-first-run',
-  '--noerrdialogs',
-
-  // throw-away profile
-  '--user-data-dir=' + probeDir,
-
-  // make ANGLE talk to V3D
-  '--enable-gpu-rasterization',
-  '--use-angle=gles',
-  '--use-gl=egl',
-  '--disable-software-rasterizer',
-
-  // minimal UI window (not headless)
-  '--app=about:blank'
-];
-
-const chrome = spawn(
-  BROWSER_BIN,
-  chromeArgs,
-  { stdio: ['ignore', 'pipe', 'pipe'], env: { DISPLAY: ':0' } }
-);
-
-
-
-  try {
-    // 2 . catch “DevTools listening on ws://…”
-    const wsUrl = await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Chrome timeout')), DEVTOOLS_TIMEOUT);
-      const scan = chunk => {
-        const m = chunk.toString().match(/DevTools listening on (ws:\/\/.*)/);
-        if (m) { clearTimeout(t); resolve(m[1].trim()); }
-      };
-      chrome.stdout.on('data', scan);
-      chrome.stderr.on('data', scan);
-    });
-
-    // 3 . ask SystemInfo.getInfo over the socket
-    const raw = await new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
-      const t  = setTimeout(() => { ws.close(); reject(new Error('DevTools timeout')); },
-                            DEVTOOLS_TIMEOUT);
-
-      ws.on('open', () =>
-        ws.send(JSON.stringify({ id: 1, method: 'SystemInfo.getInfo' }))
-      );
-
-      ws.on('message', data => {
-        const msg = JSON.parse(data);
-        if (msg.id === 1) { clearTimeout(t); ws.close(); resolve(msg.result); }
+/* GET /json from Chrome remote-debugging port */
+function fetchJson(port) {
+  return new Promise((res, rej) => {
+    http.get({ host: '127.0.0.1', port, path: '/json' }, r => {
+      let data = '';
+      r.on('data', c => (data += c));
+      r.on('end', () => {
+        try { res(JSON.parse(data)); }
+        catch (e) { rej(e); }
       });
+    }).on('error', rej);
+  });
+}
 
-      ws.on('error', err => { clearTimeout(t); reject(err); });
+/* Send Page.navigate over WebSocket to the first "page" target             */
+async function navigate(port, url) {
+  const list = await fetchJson(port);
+  const page = list.find(t => t.type === 'page');
+  if (!page) throw new Error(`no page target on port ${port}`);
+
+  return new Promise((res, rej) => {
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        id:     1,
+        method: 'Page.navigate',
+        params: { url }
+      }));
+      setTimeout(() => { ws.close(); res(); }, 200); // allow load to start
     });
+    ws.on('error', rej);
+  });
+}
 
-    return raw; // full DevTools payload (same data chrome://gpu shows)
-  } finally {
-    // 4 . clean up regardless of success/failure
-    try { chrome.kill('SIGTERM'); } catch {}
-    try { require('fs').rmSync(probeDir, { recursive: true, force: true }); } catch {}
+/* Redirect a given screen to a URL                                         */
+async function redirectBrowser(screenId, url) {
+  const port = SCREEN_PORT[screenId];
+  if (!port) {
+    console.error(`[redirect] invalid screen "${screenId}"`);
+    return;
+  }
+  try {
+    await navigate(port, url);
+    console.log(`[redirect] screen ${screenId} (${port}) → ${url}`);
+  } catch (e) {
+    console.error(`[redirect] screen ${screenId} failed: ${e.message}`);
   }
 }
 
-
-function summariseGpu(info) {
-  const f = (info.gpu && info.gpu.featureStatus) || {};
-  return {
-    videoDecode: f.videoDecode || 'unknown',
-    rasterization: f.rasterization || 'unknown',
-    gpuEnabled: /hardware|enabled/i.test(f.videoDecode) ||
-                /hardware|enabled/i.test(f.rasterization)
-  };
-}
-/* ───────────────────────────────────────────────────────────────────────── */
-
-/* ── UTILITY HELPERS  (unchanged from your original) ─────────────────────── */
-function readRes() {
-  try {
-    const xr = execSync('xrandr --current', { env: { DISPLAY: ':0' } }).toString();
-    const m1 = xr.match(/HDMI-1 connected.*? (\d+)x(\d+)/);
-    const m2 = xr.match(/HDMI-2 connected.*? (\d+)x(\d+)/);
-    return {
-      w1: m1 ? +m1[1] : 0, h1: m1 ? +m1[2] : 0,
-      w2: m2 ? +m2[1] : 0, h2: m2 ? +m2[2] : 0
-    };
-  } catch { return { w1: 0, h1: 0, w2: 0, h2: 0 }; }
-}
-
-function spawnBrowser(id, url) {
-  const { w1, h1, w2, h2 } = readRes();
-  const profile = path.join(PROFILE_DIR, `chrome${id}`);
-  try { execSync(`pkill -f -- "--user-data-dir=${profile}"`); } catch { }
-
-  const pos  = id === '2' ? `${w1},0` : '0,0';
-  const size = id === '2' ? `${w2},${h2}` : `${w1},${h1}`;
-  const args = [
-    '--kiosk',
-    '--use-gl=egl',
-    '--enable-gpu-rasterization',
-    '--ignore-gpu-blocklist',
-    '--autoplay-policy=no-user-gesture-required',
-    '--no-sandbox','--test-type',
-    '--noerrdialogs', '--disable-infobars',
-    '--disable-session-crashed-bubble',
-    `--app=${url}`,
-    `--window-position=${pos}`, `--window-size=${size}`,
-    `--user-data-dir=${profile}`
-  ];
-   
-
-  const child = spawn(BROWSER_BIN, args, {
-    env: { DISPLAY: ':0' },
-    detached: true,
-    stdio: 'ignore'
-  });
-  child.unref();
-  child.on('error', err => console.error('spawn failed', err));
-  console.log(`Screen ${id} -> ${url}`);
-}
-
+/* ─────────────────────────── State helpers ─────────────────────────────── */
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
   catch { return { hdmi1: null, hdmi2: null }; }
@@ -190,35 +77,64 @@ function saveState(state) {
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) { console.error('Could not write state file:', e); }
+  } catch (e) {
+    console.error('Could not write state file:', e);
+  }
 }
 
+/* ─────────────────────── Screen-resolution helper ────────────────────────
+   Needed by /screenshot route. Parses `xrandr` output and returns the width
+   and height for each HDMI output. Defaults to 1920x1080 if parsing fails. */
+function readRes() {
+  try {
+    const out = execSync('xrandr', { encoding: 'utf8' });
+    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
+    let m, map = {};
+    while ((m = rx.exec(out)) !== null) {
+      map[m[1]] = { w: parseInt(m[2], 10), h: parseInt(m[3], 10) };
+    }
+    const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
+    const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
+    return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
+  } catch (e) {
+    console.error('readRes failed, defaulting to 1920x1080 per screen');
+    return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
+  }
+}
+
+/* ───────────────────── diagnostics (unchanged logic) ───────────────────── */
 function getDiagnostics() {
+  /* -------- device / platform model detection --------------------------- */
   function detectDeviceModel() {
     try {
       const piModel = fs.readFileSync('/proc/device-tree/model', 'utf8').trim();
       if (piModel.length) return piModel;
-    } catch { }
-    const dmi = '/sys/devices/virtual/dmi/id';
+    } catch { /* not a Pi */ }
+
+    const dmiBase = '/sys/devices/virtual/dmi/id';
     try {
-      const prod = fs.readFileSync(path.join(dmi, 'product_name'), 'utf8').trim();
-      const ver = fs.readFileSync(path.join(dmi, 'product_version'), 'utf8').trim();
-      const ven = fs.readFileSync(path.join(dmi, 'sys_vendor'), 'utf8').trim();
-      const parts = [ven, prod, ver].filter(Boolean);
+      const product  = fs.readFileSync(path.join(dmiBase, 'product_name'  ), 'utf8').trim();
+      const version  = fs.readFileSync(path.join(dmiBase, 'product_version'), 'utf8').trim();
+      const vendor   = fs.readFileSync(path.join(dmiBase, 'sys_vendor'     ), 'utf8').trim();
+      const parts = [vendor, product, version].filter(Boolean);
       if (parts.length) return parts.join(' ');
-    } catch { }
+    } catch { /* no DMI */ }
+
     try {
       const out = execSync('hostnamectl', { encoding: 'utf8' });
       const m = out.match(/Hardware Model:\s+(.+)/);
       if (m) return m[1].trim();
-    } catch { }
+    } catch { /* cmd missing */ }
+
     try {
-      const cpu = (os.cpus()?.[0]?.model || '').trim();
-      if (cpu.length) return cpu;
-    } catch { }
+      const cpuModel = (os.cpus()?.[0]?.model || '').trim();
+      if (cpuModel.length) return cpuModel;
+    } catch {}
+
     return 'unknown';
   }
 
+  /* -------- network interfaces ------------------------------------------ */
   const nets = os.networkInterfaces();
   const ifaces = [];
   for (const [name, arr] of Object.entries(nets)) {
@@ -238,93 +154,73 @@ function getDiagnostics() {
   };
 }
 
-function ipv4Of(iface = 'eth0') {
-  const nicArr = os.networkInterfaces()[iface];
-  if (!nicArr) return null;
-  for (const n of nicArr) if (n.family === 'IPv4' && !n.internal) return n.address;
-  return null;
-}
-
-async function registerSelf() {
-  try {
-    const ip = ipv4Of('eth0');
-    if (!ip) return console.error('[register] eth0 missing/no IPv4');
-    await fetch('http://10.1.220.203:7070/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ip_eth0: ip })
-    });
-    console.log(`[register] announced ${ip} to File-SD`);
-  } catch (e) {
-    console.error('[register] failed:', e.message);
-  }
-}
-
-/* ── EXPRESS SETUP & ROUTES ─────────────────────────────────────────────── */
+/* ─────────────────────────── express setup ─────────────────────────────── */
 const app = express();
 app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-/* 1 screenshot endpoint --------------------------------------------------- */
+/* 1 ─ screenshot endpoint -------------------------------------------------- */
 app.get('/screenshot/:id', (req, res) => {
   const { w1, h1, w2, h2 } = readRes();
-  const id = req.params.id;
-  const tmp = `/tmp/screen${id}.png`;
-  const out = `/tmp/screen${id}.jpg`;
-  const wantW = parseInt(req.query.maxw, 10);
-  const wantQ = parseInt(req.query.quality, 10);
+  const id      = req.params.id;
+  const tmpPng  = `/tmp/screen${id}.png`;      // raw capture
+  const outFile = `/tmp/screen${id}.jpg`;      // final file we may send
+  const wantW   = parseInt(req.query.maxw, 10);   // NaN if missing
+  const wantQ   = parseInt(req.query.quality, 10); // NaN if missing
 
   try {
-    if (id === '1') execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmp}`);
-    else if (id === '2') execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${tmp}`);
-    else return res.status(400).send('invalid id');
+    if (id === '1')
+      execSync(`DISPLAY=:0 scrot -a 0,0,${w1},${h1} -o ${tmpPng}`);
+    else if (id === '2')
+      execSync(`DISPLAY=:0 scrot -a ${w1},0,${w2},${h2} -o ${tmpPng}`);
+    else
+      return res.status(400).send('invalid id');
   } catch (e) {
-    console.error(e); return res.status(500).send('screen grab failed');
+    console.error(e);
+    return res.status(500).send('screen grab failed');
   }
 
-  const needResize = !Number.isNaN(wantW);
+  const needResize  = !Number.isNaN(wantW);
   const needQuality = !Number.isNaN(wantQ);
   if (needResize || needQuality) {
     try {
-      const resizeOpt = needResize ? ` -resize ${wantW}` : '';
+      const resizeOpt  = needResize  ? ` -resize ${wantW}` : '';
       const qualityOpt = needQuality ? ` -quality ${wantQ}` : ' -quality 90';
-      execSync(`convert ${tmp}${resizeOpt}${qualityOpt} ${out}`);
-      res.type('jpeg').send(fs.readFileSync(out));
+      execSync(`convert ${tmpPng}${resizeOpt}${qualityOpt} ${outFile}`);
+      res.type('jpeg').send(fs.readFileSync(outFile));
     } catch (e) {
-      console.error('convert failed', e);
+      console.error('imagemagick convert failed', e);
       return res.status(500).send('image conversion failed');
     }
   } else {
-    res.type('png').send(fs.readFileSync(tmp));
+    res.type('png').send(fs.readFileSync(tmpPng));
   }
 });
 
-/* 2 simple diagnostics ---------------------------------------------------- */
+/* 2 ─ raw JSON diagnostics ------------------------------------------------- */
 app.get('/diagnostic', (req, res) => {
-   res.json(getDiagnostics());
+  res.json(getDiagnostics());
 });
 
-/* 3 diagnostics UI (adds GPU summary) ------------------------------------- */
-app.get('/diagnostic-ui', async (req, res) => {
-  const state = loadState();
-  const screen = req.query.screen;
-  const target = screen === '1' ? state.hdmi1
-    : screen === '2' ? state.hdmi2 : null;
+/* 3 ─ diagnostics UI ------------------------------------------------------- */
+app.get('/diagnostic-ui', (req, res) => {
+  const state  = loadState();                  // { hdmi1, hdmi2 }
+  const screen = req.query.screen;             // "1" | "2" | undefined
+  let target   = null;
 
-  let gpu = null;
-  try { gpu = summariseGpu(await devToolsProbe()); }
-  catch (e) { console.error('[gpu probe] failed:', e.message); }
+  if (screen === '1')      target = state.hdmi1;
+  else if (screen === '2') target = state.hdmi2;
 
   res.render('diagnostic-ui', {
-    d: getDiagnostics(),
-    gpu: gpu,
-    urls: state,
-    target, screen
+    d:     getDiagnostics(),
+    urls:  state,          // pass both HDMI URLs to EJS
+    target,
+    screen
   });
 });
 
-/* 4 reboot --------------------------------------------------------------- */
+/* 4 ─ reboot endpoint ------------------------------------------------------ */
 app.post('/reboot', (req, res) => {
   res.send('Rebooting…');
   setTimeout(() => {
@@ -332,56 +228,76 @@ app.post('/reboot', (req, res) => {
   }, 100);
 });
 
-/* 5 URL management -------------------------------------------------------- */
-app.get('/set-url/:id', (req, res) => {
-  const id = req.params.id; const url = req.query.url;
-  if (!url) return res.status(400).send('missing url');
-  if (id !== '1' && id !== '2') return res.status(400).send('invalid id');
-
-  spawnBrowser(id, url);
-  const state = loadState(); if (id === '1') state.hdmi1 = url; else state.hdmi2 = url;
-  saveState(state); res.send('OK');
+/* saved-urls: GET returns state, POST updates AND refreshes screens -------- */
+app.get('/saved-urls', (req, res) => {
+  res.json(loadState());
 });
-app.get('/saved-urls', (req, res) => { res.json(loadState()); });
+
 app.post('/saved-urls', (req, res) => {
   const { hdmi1, hdmi2 } = req.body || {};
-  const ok = v => typeof v === 'string' || v === null || typeof v === 'undefined';
-  if (!ok(hdmi1) || !ok(hdmi2)) return res.status(400).send('hdmi1/hdmi2 bad');
+
+  const okType = v => typeof v === 'string' || v === null || typeof v === 'undefined';
+  if (!okType(hdmi1) || !okType(hdmi2))
+    return res.status(400).send('hdmi1/hdmi2 must be string, null, or omitted');
 
   const state = loadState();
+
   if (typeof hdmi1 !== 'undefined') {
     state.hdmi1 = hdmi1;
-    if (typeof hdmi1 === 'string' && hdmi1.length) {
-      spawnBrowser('1', hdmi1);                // refresh screen 1
-    }
+    if (typeof hdmi1 === 'string' && hdmi1.length) redirectBrowser('1', hdmi1);
   }
+
   if (typeof hdmi2 !== 'undefined') {
     state.hdmi2 = hdmi2;
-    if (typeof hdmi2 === 'string' && hdmi2.length) {
-      spawnBrowser('2', hdmi2);                // refresh screen 2
-    }
+    if (typeof hdmi2 === 'string' && hdmi2.length) redirectBrowser('2', hdmi2);
   }
-  saveState(state); 
+
+  saveState(state);
   res.json(state);
 });
 
-/* 6 GPU info API ---------------------------------------------------------- */
-app.get('/gpu-info', async (req, res) => {
-  try {
-    const raw = await devToolsProbe();
-    res.json({ summary: summariseGpu(raw), raw });
-  } catch (err) {
-    console.error('[gpu-info] probe failed:', err.message);
-    try { spawnSync('pkill', ['-f', 'chrome-gpu-probe']); } catch { }
-    res.status(500).json({ error: err.message });
+/* ───────────────────── optional registration helper ────────────────────── */
+function ipv4Of(ifaceName = 'eth0') {
+  const nicArr = os.networkInterfaces()[ifaceName];
+  if (!nicArr) return null;
+  for (const n of nicArr) {
+    if (n.family === 'IPv4' && !n.internal) return n.address;
   }
-});
+  return null;
+}
 
-/* ── START SERVER ───────────────────────────────────────────────────────── */
+async function registerSelf() {
+  try {
+    const ip = ipv4Of('eth0');
+    if (!ip) {
+      console.error('[register] eth0 not found or no IPv4 - skipping');
+      return;
+    }
+
+    const res = await fetch('http://10.1.220.203:7070/data', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ ip_eth0: ip })
+    });
+
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error(`[register] server replied ${res.status}: ${txt}`);
+    } else {
+      console.log(`[register] announced ${ip} to File-SD`);
+    }
+  } catch (err) {
+    console.error('[register] failed:', err.message || err);
+  }
+}
+
+/* ──────────────────────────── start server ─────────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
+
   const diagBase = `http://localhost:${PORT}/diagnostic-ui`;
-  spawnBrowser('1', `${diagBase}?screen=1`);
-  spawnBrowser('2', `${diagBase}?screen=2`);
+
+  redirectBrowser('1', `${diagBase}?screen=1`);
+  redirectBrowser('2', `${diagBase}?screen=2`);
   registerSelf();
 });
