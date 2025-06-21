@@ -155,23 +155,7 @@ function saveState (state) {
   }
 }
 
-/* ─────────────────────── Screen-resolution helper ─────────────────────── */
-function readRes () {
-  try {
-    const out = execSync('xrandr', { encoding: 'utf8' });
-    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
-    let m, map = {};
-    while ((m = rx.exec(out)) !== null) {
-      map[m[1]] = { w: +m[2], h: +m[3] };
-    }
-    const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
-    const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
-    return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
-  } catch {
-    console.error('readRes failed, defaulting 1920×1080 per screen');
-    return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
-  }
-}
+ 
 
 /* ───────────────── diagnostics (unchanged logic) ───────────────────────── */
 function getDiagnostics () {
@@ -225,7 +209,6 @@ const app = express();
 app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
-
 /* ---------- find a running Wayland socket even when we are root ---------- */
 function detectStack () {
   // 1. Normal case: variables already present (started with sudo -E, etc.)
@@ -255,56 +238,132 @@ function detectStack () {
 
   return 'unknown';
 }
+ /* ───────────────────────── Screen-resolution helper ────────────────────── */
+function readRes () {
+  try {
+    const out = execSync('xrandr', { encoding: 'utf8' });
+    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
+    let m, map = {};
+    while ((m = rx.exec(out)) !== null) {
+      map[m[1]] = { w: +m[2], h: +m[3] };
+    }
+    const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
+    const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
+    return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
+  } catch {
+    console.error('readRes failed, defaulting 1920×1080 per screen');
+    return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
+  }
+}
 
-/* ─── Wayland geometry helper (grim wants “x,y widthxheight”) ─── */
+/* ─────────────── Wayland geometry helper (grim wants “x,y widthxheight”) ─ */
 function wlGeom ({ x, y, w, h }) {
   return `${x},${y} ${w}x${h}`;
 }
 
-/* ─── screenshot endpoint (Wayfire-ready) ─── */
+/* ───────────────────── Find a usable /dev/dri/cardX for kmsgrab ────────── */
+function findDrmCard () {
+  try {
+    const dri = '/dev/dri';
+    for (const name of fs.readdirSync(dri)) {
+      if (name.startsWith('card')) {
+        const p = path.join(dri, name);
+        try { fs.accessSync(p, fs.constants.R_OK); return p; } catch {}
+      }
+    }
+  } catch {}
+  return null;          // none found or not readable
+}
+
+/* ────────────────────── Screenshot endpoint with fallbacks ─────────────── */
 app.get('/screenshot/:id', (req, res) => {
   const id = req.params.id;
-  const { w1, h1, w2, h2 } = readRes(); 
+  const { w1, h1, w2, h2 } = readRes();
 
   const geom = id === '1'
-    ? { x: 0,   y: 0,     w: w1, h: h1 }
+    ? { x: 0,  y: 0,  w: w1, h: h1 }
     : id === '2'
-    ? { x: w1,  y: 0,     w: w2, h: h2 }
+    ? { x: w1, y: 0,  w: w2, h: h2 }
     : null;
 
   if (!geom) return res.status(400).send('invalid id');
 
-  const tmp = `/tmp/screen${id}-${Date.now()}.png`;
-  const stack = detectStack();
-
+  const tmp   = `/tmp/screen${id}-${Date.now()}.png`;
+  const stack = detectStack();     // your existing helper
   let cmd;
+
+/* -------- attempt 1: Wayland / grim ------------------------------------- */
   if (stack === 'wayland') {
-    /* Wayfire / wlroots - grim talks to the compositor directly */
     cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
-  } else if (stack === 'kms') {
-    /* fallback: drm scan-out grab (works under Wayland too, needs CAP_SYS_ADMIN) */
-    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device /dev/dri/card0 `
-        + `-i - -frames:v 1 -vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
-  } else if (stack === 'legacy') {
-    cmd = `raspi2png -p ${tmp} -w ${geom.w} -h ${geom.h}`;
-  } else {
-    return res.status(500).send('no capture backend available');
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] grim failed:', e.message); }
   }
 
-  try { execSync(cmd, { stdio: 'inherit' }); }
-  catch (e) { console.error('capture failed:', e); return res.status(500).send('capture failed'); }
+/* -------- attempt 2: DRM / kmsgrab -------------------------------------- */
+  const drm = findDrmCard();
+  if (drm) {
+    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device ${drm} `
+        + `-i - -frames:v 1 `
+        + `-vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] kmsgrab failed:', e.message); }
+  } else {
+    console.warn('[capture] no /dev/dri/cardX found, skipping kmsgrab');
+  }
 
-  /* optional resize / JPEG */
+/* -------- attempt 3: X11 / x11grab -------------------------------------- */
+  cmd = `ffmpeg -hide_banner -loglevel error -f x11grab `
+      + `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} `
+      + `-frames:v 1 -y ${tmp}`;
+  try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+  catch (e) { console.error('[capture] x11grab failed:', e.message); }
+
+  return res.status(500).send('capture failed');
+
+/* ------------------------- helper: stream result ------------------------- */
+ /* ------------------------- helper: stream result ------------------------- */
+function sendImage () {
   const wantW = +req.query.maxw   || NaN;
   const wantQ = +req.query.quality || 90;
-  if (!Number.isNaN(wantW) || wantQ !== 90) {
-    const jpg = tmp.replace(/\.png$/, '.jpg');
-    execSync(`convert ${tmp}${!Number.isNaN(wantW) ? ` -resize ${wantW}` : ''} `
-           + `-quality ${wantQ} ${jpg}`);
-    return res.type('jpeg').send(fs.readFileSync(jpg));
+
+  let file   = tmp;        // what we’ll actually send
+  let type   = 'png';      // MIME type
+  let extra  = null;       // second file to delete (jpg)
+
+  try {
+    if (!Number.isNaN(wantW) || wantQ !== 90) {
+      const jpg = tmp.replace(/\.png$/, '.jpg');
+      execSync(
+        `convert ${tmp}` +
+        (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
+        ` -quality ${wantQ} ${jpg}`
+      );
+      file  = jpg;
+      extra = jpg;         // remember to delete it later
+      type  = 'jpeg';
+    }
+  } catch (e) {
+    console.warn('[capture] convert failed, falling back to PNG:', e.message);
   }
-  res.type('png').send(fs.readFileSync(tmp));
+
+  // Stream the image to the client
+  res.type(type);
+  const stream = fs.createReadStream(file);
+  stream.pipe(res);
+
+  // When the response is done (or aborted) – delete temp files
+  const cleanup = () => {
+    fs.unlink(tmp,  () => {});      // original PNG
+    if (extra) fs.unlink(extra, () => {});
+  };
+  res.once('finish', cleanup);
+  res.once('close',  cleanup);
+}
+
 });
+
+ 
+ 
 
 
 /* 2 ─ raw JSON diagnostics ------------------------------------------------- */
@@ -356,11 +415,7 @@ app.post('/saved-urls', (req, res) => {
   res.json(state);
 });
 
-/* ───────────────────── optional registration helper ────────────────────── */
-function ipv4Of (iface = 'eth0') {
-  const nicArr = os.networkInterfaces()[iface];
-  return nicArr?.find(n => n.family === 'IPv4' && !n.internal)?.address || null;
-}
+ 
  
 /* ───────────────────── optional registration helper ────────────────────── */
 
