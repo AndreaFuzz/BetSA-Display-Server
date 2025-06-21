@@ -48,7 +48,7 @@ class DevToolsController {
     this.connect();                  // start immediately
   }
 
-  /* Public – navigate (or queue) ----------------------------------------- */
+  /* Public - navigate (or queue) ----------------------------------------- */
   navigate (url) {
     this.desiredUrl = url;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -58,7 +58,7 @@ class DevToolsController {
     }
   }
 
-  /* Internal – open WS (gets new target each time!) ---------------------- */
+  /* Internal - open WS (gets new target each time!) ---------------------- */
   async connect () {
     try {
       const list = await fetchJson(this.port);
@@ -97,7 +97,7 @@ class DevToolsController {
     }
   }
 
-  /* Helper – actually send Page.navigate --------------------------------- */
+  /* Helper - actually send Page.navigate --------------------------------- */
   sendNavigate (url) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({
@@ -279,7 +279,7 @@ app.get('/screenshot/:id', (req, res) => {
 
   let cmd;
   if (stack === 'wayland') {
-    /* Wayfire / wlroots – grim talks to the compositor directly */
+    /* Wayfire / wlroots - grim talks to the compositor directly */
     cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
   } else if (stack === 'kms') {
     /* fallback: drm scan-out grab (works under Wayland too, needs CAP_SYS_ADMIN) */
@@ -362,23 +362,42 @@ function ipv4Of (iface = 'eth0') {
   return nicArr?.find(n => n.family === 'IPv4' && !n.internal)?.address || null;
 }
  
-async function registerSelf () {
-  try {
-    const ip = ipv4Of('eth0');
-    if (!ip) return console.error('[register] no eth0 IPv4 – skipping');
+/* ───────────────────── optional registration helper ────────────────────── */
 
+/** Return the first active, non-internal IPv4 interface (name + address). */
+function detectPrimaryIPv4 () {
+  for (const [name, nics] of Object.entries(os.networkInterfaces())) {
+    for (const nic of nics) {
+      if (nic.family === 'IPv4' && !nic.internal) {
+        return { name, ip: nic.address };
+      }
+    }
+  }
+  return null;            // nothing suitable found
+}
+
+async function registerSelf () {
+  const primary = detectPrimaryIPv4();
+  if (!primary) {
+    console.error('[register] no usable IPv4 interface - skipping');
+    return;
+  }
+
+   
+  try {
     const res = await fetch('http://10.1.220.203:7070/data', {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify({ ip_eth0: ip })
+      body   : JSON.stringify({ ip_eth0: primary.ip })
     });
 
-    if (!res.ok) console.error(`[register] server ${res.status}`);
-    else         console.log(`[register] announced ${ip}`);
+    if (!res.ok) console.error(`[register] server responded ${res.status}`);
+    else         console.log(`[register] announced ${primary.name} - ${primary.ip}`);
   } catch (e) {
     console.error('[register] failed:', e.message);
   }
 }
+
 
 /* ──────────────────────────── start server ─────────────────────────────── */
 app.listen(PORT, () => {
