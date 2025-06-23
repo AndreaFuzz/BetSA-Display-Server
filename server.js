@@ -440,7 +440,7 @@ async function registerSelf () {
 
    
   try {
-    const res = await fetch('http://10.1.220.203:7070/data', {
+    const res = await fetch('http://10.1.220.219:7070/data', {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({ ip_eth0: primary.ip })
