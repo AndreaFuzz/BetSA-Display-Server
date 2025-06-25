@@ -431,26 +431,33 @@ function detectPrimaryIPv4 () {
   return null;            // nothing suitable found
 }
 
-async function registerSelf () {
+/* Try to announce; on any failure wait 2 s and retry forever -------------- */
+function registerSelf () {
   const primary = detectPrimaryIPv4();
   if (!primary) {
-    console.error('[register] no usable IPv4 interface - skipping');
-    return;
+    console.error('[register] no usable IPv4 interface');
+    return scheduleRetry();
   }
 
-   
-  try {
-    const res = await fetch('http://10.1.220.219:7070/data', {
-      method : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify({ ip_eth0: primary.ip })
-    });
+  fetch('http://10.1.220.219:7070/data', {
+    method : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body   : JSON.stringify({ ip_eth0: primary.ip })
+  })
+  .then(res => {
+    if (!res.ok) throw new Error('server responded ' + res.status);
+    console.log(`[register] announced ${primary.name} – ${primary.ip}`);
+    /* success: nothing else to do */
+  })
+  .catch(err => {
+    console.error('[register] failed:', err.message);
+    scheduleRetry();
+  });
+}
 
-    if (!res.ok) console.error(`[register] server responded ${res.status}`);
-    else         console.log(`[register] announced ${primary.name} - ${primary.ip}`);
-  } catch (e) {
-    console.error('[register] failed:', e.message);
-  }
+/* Helper: retry after 2 s ------------------------------------------------- */
+function scheduleRetry () {
+  setTimeout(registerSelf, 2000);
 }
 
 
