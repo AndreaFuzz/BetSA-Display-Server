@@ -351,7 +351,7 @@ function sendImage () {
   const stream = fs.createReadStream(file);
   stream.pipe(res);
 
-  // When the response is done (or aborted) – delete temp files
+  // When the response is done (or aborted) - delete temp files
   const cleanup = () => {
     fs.unlink(tmp,  () => {});      // original PNG
     if (extra) fs.unlink(extra, () => {});
@@ -415,7 +415,97 @@ app.post('/saved-urls', (req, res) => {
   res.json(state);
 });
 
- 
+/* ────────────────────────── mouse-cursor helpers ───────────────────────── */
+
+/* 1. Persistent flag location */
+const POINTER_FILE = '/home/admin/kiosk/pointer.json';
+
+/* 2. Read / write helpers (best-effort, never throw) */
+function loadPointerState () {
+  try   { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); }
+  catch { return { hidden: false }; }
+}
+function savePointerState (state) {
+  try {
+    fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true });
+    fs.writeFileSync(POINTER_FILE, JSON.stringify(state));
+  } catch (e) {
+    console.error('[mouse] could not persist pointer state:', e);
+  }
+}
+
+/* 3. Runtime probe – checks if an unclutter process is running for admin   */
+function isCursorHidden () {
+  try {                                   // pgrep exits 0 if it finds a pid
+    execSync('pgrep -u admin unclutter', { stdio: 'ignore' });
+    return true;
+  } catch {                               // any error means not found / visible
+    return false;
+  }
+}
+
+/* 4. Hide and show commands (fast, no output noise)                        */
+function hideCursor () {
+  try {
+    execSync(
+      'sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true',
+      { stdio: 'ignore' }
+    );
+    /* start unclutter detached so server thread is not blocked */
+    spawn(
+      'sudo',
+      [
+        '-u', 'admin',
+        'DISPLAY=:0', 'XAUTHORITY=/home/admin/.Xauthority',
+        'unclutter', '-idle', '0', '-root'
+      ],
+      { detached: true, stdio: 'ignore' }
+    ).unref();
+  } catch (e) {
+    console.error('[mouse] hide failed:', e.message);
+  }
+}
+
+function showCursor () {
+  try {
+    execSync(
+      'sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true',
+      { stdio: 'ignore' }
+    );
+  } catch (e) {
+    console.error('[mouse] show failed:', e.message);
+  }
+}
+
+/* 5. Initialise persisted state once at boot                               */
+savePointerState({ hidden: isCursorHidden() });
+
+/* ────────────────────────── HTTP API endpoints ─────────────────────────── */
+
+/* Current status */
+app.get('/mouse', (_, res) => {
+  res.json({ hidden: isCursorHidden() });
+});
+
+/* Toggle */
+app.post('/mouse', (req, res) => {
+  const body   = req.body || {};
+  const target = body.hidden;
+
+  if (typeof target !== 'boolean')
+    return res.status(400).send('Expecting JSON body { "hidden": true|false }');
+
+  const currentlyHidden = isCursorHidden();
+
+  if (target && !currentlyHidden) hideCursor();
+  if (!target && currentlyHidden) showCursor();
+
+  /* update flag either way */
+  savePointerState({ hidden: target });
+
+  res.json({ hidden: target });
+});
+
  
 /* ───────────────────── optional registration helper ────────────────────── */
 
@@ -446,7 +536,7 @@ function registerSelf () {
   })
   .then(res => {
     if (!res.ok) throw new Error('server responded ' + res.status);
-    console.log(`[register] announced ${primary.name} – ${primary.ip}`);
+    console.log(`[register] announced ${primary.name} - ${primary.ip}`);
     /* success: nothing else to do */
   })
   .catch(err => {
