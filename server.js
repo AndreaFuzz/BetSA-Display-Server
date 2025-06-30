@@ -47,7 +47,9 @@ function postToHub(path, payload, delay = 2000) {
       setTimeout(() => postToHub(path, payload, Math.min(delay * 2, 60000)), delay);
     });
 }
-
+function announceMouse (hidden) {
+  postToHub('/device/mouse', { mac: DEVICE_MAC, mouse: { hidden } });
+}
 function announceSelf() {
   postToHub('/device', {
     mac: DEVICE_MAC,
@@ -259,11 +261,15 @@ app.post('/saved-urls', (req, res) => {
 app.get('/mouse', (_, res) => res.json(loadPointerState()));
 app.post('/mouse', (req, res) => {
   const { hidden } = req.body || {};
-  if (typeof hidden !== 'boolean') return res.status(400).send('Expecting JSON body { "hidden": true|false }');
-  const runtime = isCursorHidden();
-  if (hidden && !runtime) hideCursor();
-  if (!hidden && runtime) showCursor();
+  if (typeof hidden !== 'boolean')
+    return res.status(400).send('Expecting JSON body { "hidden": true|false }');
+
+  const wasHidden = isCursorHidden();
+  if (hidden && !wasHidden) hideCursor();
+  if (!hidden && wasHidden) showCursor();
+
   savePointerState({ hidden });
+  announceMouse(hidden);            // ← tell the hub
   res.json({ hidden });
 });
 
