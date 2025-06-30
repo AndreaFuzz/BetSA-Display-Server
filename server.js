@@ -59,7 +59,7 @@ function announceSelf() {
   });
 }
 function announceUrls(urls) { postToHub('/device/urls', { mac: DEVICE_MAC, urls }); }
-
+//change
 /* ───────────────── DevTools auto-reconnect controller ─────────────────── */
 function fetchJson(port) {
   return new Promise((res, rej) => {
