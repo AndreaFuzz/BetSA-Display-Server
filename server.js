@@ -166,20 +166,45 @@ function showCursor() { try { execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/hom
 (() => { const s = loadPointerState(), r = isCursorHidden(); if (s.hidden && !r) hideCursor(); if (!s.hidden && r) showCursor(); })();
 
 /* ───────────────────────── screenshot helper ──────────────────────────── */
+/* ───────────────────── better resolution helper ──────────────────────── */
+/* Guarantees the numbers we pass to ffmpeg never exceed the real          */
+/* root-window size, so x11grab cannot fall “outside the screen size”.     */
 function readRes() {
+  /* 1) Ask X for the current root-window dimensions (e.g. 1024x768) */
+  let rootW = 1920, rootH = 1080;   // sensible fallback
   try {
-    const out = execSync('xrandr', { encoding: 'utf8' });
-    const rx = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
-    let m, map = {};
-    while ((m = rx.exec(out)) !== null) map[m[1]] = { w: +m[2], h: +m[3] };
-    const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
-    const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
-    return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
-  } catch {
-    console.error('readRes failed, defaulting 1920×1080 per screen');
-    return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
+    const dims = execSync(
+      "xdpyinfo | awk '/dimensions/{print $2}'",
+      { encoding: "utf8" }
+    ).trim();                        // "WIDTHxHEIGHT"
+    [rootW, rootH] = dims.split("x").map(Number);
+  } catch (e) {
+    console.error("xdpyinfo failed, using 1920x1080 default:", e.message);
   }
+
+  /* 2) Parse per-output modes from xrandr (keeps multi-monitor support) */
+  const map = {};
+  try {
+    const out = execSync("xrandr", { encoding: "utf8" });
+    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
+    let m;
+    while ((m = rx.exec(out)) !== null) {
+      map[m[1]] = { w: +m[2], h: +m[3] };
+    }
+  } catch (e) {
+    console.error("xrandr failed, falling back on root size:", e.message);
+  }
+
+  /* 3) Fallback to root size and clamp anything larger than the root */
+  const h1 = map["HDMI-1"] || { w: rootW, h: rootH };
+  const h2 = map["HDMI-2"] || { w: rootW, h: rootH };
+
+  h1.w = Math.min(h1.w, rootW);  h1.h = Math.min(h1.h, rootH);
+  h2.w = Math.min(h2.w, rootW);  h2.h = Math.min(h2.h, rootH);
+
+  return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
 }
+
 
 /* ───────────────────────── express setup ──────────────────────────────── */
 const app = express();
