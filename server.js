@@ -1,252 +1,175 @@
-// server.js ─ BETSA kiosk helper with EJS diagnostics UI & auto-reconnecting DevTools
+/* server.js ─ BETSA kiosk helper with EJS diagnostics UI & auto-reconnecting DevTools */
 /* eslint-disable no-console */
+'use strict';
 
-const express      = require('express');
-const fs           = require('fs');
+const express = require('express');
+const fs = require('fs');
 const { execSync, spawn } = require('child_process');
-const os           = require('os');
-const path         = require('path');
-const http         = require('http');
-const WebSocket    = require('ws');
-const fetch        = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
+const os = require('os');
+const path = require('path');
+const http = require('http');
+const WebSocket = require('ws');
+const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-const PORT        = 8080;                       // HTTP API / UI port
-const STATE_FILE  = '/home/admin/kiosk/urls.json'; // persistent store for HDMI URLs
+/* ───────────────────────────── constants ──────────────────────────────── */
+const PORT = 8080;                          // HTTP API / UI port
+const STATE_FILE = '/home/admin/kiosk/urls.json'; // persistent store for HDMI URLs
+const POINTER_FILE = '/home/admin/kiosk/pointer.json';
 
-/* ─────────────────── DevTools auto-reconnect controller ────────────────── */
+const SCREEN_PORT = { '1': 9222, '2': 9223 };      // HDMI-1 / HDMI-2 debug ports
+const HUB = 'http://10.1.220.219:7070';    // central server
 
-const SCREEN_PORT = { '1': 9222, '2': 9223 };   // HDMI-1 / HDMI-2 debug ports
+/* ───────────────────────── hub helpers / 7070 ─────────────────────────── */
+function getMacAddress() {
+  for (const nics of Object.values(os.networkInterfaces())) {
+    for (const nic of nics) {
+      if (nic.family === 'IPv4' && !nic.internal && nic.mac &&
+        nic.mac !== '00:00:00:00:00:00')
+        return nic.mac;
+    }
+  }
+  return 'unknown';
+}
+const DEVICE_MAC = getMacAddress();
 
-/* Fetch /json array from Chrome’s remote-debug port ----------------------- */
-function fetchJson (port) {
+function postToHub(path, payload, delay = 2000) {
+  fetch(`${HUB}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(res => {
+      if (!res.ok) throw new Error(`hub responded ${res.status}`);
+      console.log(`[hub] POST ${path} ok`);
+    })
+    .catch(err => {
+      console.error(`[hub] POST ${path} failed: ${err.message}`);
+      setTimeout(() => postToHub(path, payload, Math.min(delay * 2, 60000)), delay);
+    });
+}
+
+function announceSelf() {
+  postToHub('/device', {
+    mac: DEVICE_MAC,
+    urls: loadState(),
+    mouse: loadPointerState(),
+    diag: getDiagnostics()
+  });
+}
+function announceUrls(urls) { postToHub('/device/urls', { mac: DEVICE_MAC, urls }); }
+
+/* ───────────────── DevTools auto-reconnect controller ─────────────────── */
+function fetchJson(port) {
   return new Promise((res, rej) => {
     http.get({ host: '127.0.0.1', port, path: '/json' }, r => {
       let data = '';
       r.on('data', c => (data += c));
-      r.on('end', () => {
-        try { res(JSON.parse(data)); }
-        catch (e) { rej(e); }
-      });
+      r.on('end', () => { try { res(JSON.parse(data)); } catch (e) { rej(e); } });
     }).on('error', rej);
   });
 }
 
-/* One resilient connection per screen ------------------------------------- */
-/* One resilient connection per screen ------------------------------------- */
 class DevToolsController {
-  constructor (screenId, port) {
-    this.screenId   = screenId;
-    this.port       = port;
-    this.ws         = null;          // active WebSocket (or null)
-    this.timer      = null;          // reconnect timer handle
-    this.desiredUrl = null;          // last URL we were asked to show
-
-    /* ── log-throttling helpers ── */
-    this.errorShown = false;         // true after first “connect failed” or WS error
-    this.backoff    = 2000;          // start at 2 s, doubles to reduce noise
-
-    this.connect();                  // start immediately
+  constructor(screenId, port) {
+    this.screenId = screenId;
+    this.port = port;
+    this.ws = null;
+    this.timer = null;
+    this.desired = null;
+    this.error = false;
+    this.backoff = 2000;
+    this.connect();
   }
-
-  /* Public - navigate (or queue) ----------------------------------------- */
-  navigate (url) {
-    this.desiredUrl = url;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendNavigate(url);
-    } else {
-      this.ensureConnection();
-    }
+  navigate(url) {
+    this.desired = url;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.send(url);
+    else this.ensure();
   }
-
-  /* Internal - open WS (gets new target each time!) ---------------------- */
-  async connect () {
+  async connect() {
     try {
       const list = await fetchJson(this.port);
       const page = list.find(t => t.type === 'page');
       if (!page) throw new Error('no "page" target');
-
       this.ws = new WebSocket(page.webSocketDebuggerUrl);
-
       this.ws.on('open', () => {
         console.log(`[ws] screen ${this.screenId} connected`);
-        this.errorShown = false;     // reset throttle after success
-        this.backoff    = 2000;      // reset back-off
-        if (this.desiredUrl) this.sendNavigate(this.desiredUrl);
+        this.error = false; this.backoff = 2000;
+        if (this.desired) this.send(this.desired);
       });
-
       this.ws.on('close', () => {
-        if (!this.errorShown) console.warn(`[ws] screen ${this.screenId} closed`);
-        this.errorShown = true;
-        this.ws = null;
-        this.scheduleReconnect();
+        if (!this.error) console.warn(`[ws] screen ${this.screenId} closed`);
+        this.error = true; this.ws = null; this.schedule();
       });
-
-      this.ws.on('error', err => {
-        if (!this.errorShown) console.warn(
-          `[ws] screen ${this.screenId} error: ${err.message}`
-        );
-        this.errorShown = true;
-        this.ws.close();             // triggers 'close' for unified handling
+      this.ws.on('error', e => {
+        if (!this.error) console.warn(`[ws] screen ${this.screenId} error: ${e.message}`);
+        this.error = true; this.ws.close();
       });
     } catch (e) {
-      if (!this.errorShown) console.warn(
-        `[ws] screen ${this.screenId} connect failed: ${e.message}`
-      );
-      this.errorShown = true;
-      this.scheduleReconnect();
+      if (!this.error) console.warn(`[ws] screen ${this.screenId} connect failed: ${e.message}`);
+      this.error = true; this.schedule();
     }
   }
-
-  /* Helper - actually send Page.navigate --------------------------------- */
-  sendNavigate (url) {
+  send(url) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({
-      id: 1,
-      method: 'Page.navigate',
-      params: { url }
-    }));
+    this.ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
     console.log(`[redirect] screen ${this.screenId} (${this.port}) → ${url}`);
   }
-
-  /* Ensure we’re (re-)connecting ----------------------------------------- */
-  ensureConnection () {
-    if (!this.ws && !this.timer) this.scheduleReconnect(0);
-  }
-
-  /* Schedule reconnect with exponential back-off ------------------------- */
-  scheduleReconnect (delay = this.backoff) {
-    if (this.timer) return;          // already waiting
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.connect();
-    }, delay);
-
-    // next attempt waits twice as long, max 60 s
+  ensure() { if (!this.ws && !this.timer) this.schedule(0); }
+  schedule(d = this.backoff) {
+    if (this.timer) return;
+    this.timer = setTimeout(() => { this.timer = null; this.connect(); }, d);
     this.backoff = Math.min(this.backoff * 2, 60000);
   }
 }
+const controllers = {}; for (const [id, port] of Object.entries(SCREEN_PORT)) controllers[id] = new DevToolsController(id, port);
+function redirectBrowser(id, url) { const c = controllers[id]; if (c) c.navigate(url); }
 
+/* ─────────────────────────── state helpers ────────────────────────────── */
+function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return { hdmi1: null, hdmi2: null }; } }
+function saveState(s) { try { fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true }); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch (e) { console.error('Could not write state:', e); } }
 
-/* Instantiate controllers for both screens ------------------------------- */
-const controllers = {};
-for (const [id, port] of Object.entries(SCREEN_PORT)) {
-  controllers[id] = new DevToolsController(id, port);
-}
-
-/* Thin wrapper so the rest of the code doesn’t change -------------------- */
-function redirectBrowser (screenId, url) {
-  const c = controllers[screenId];
-  if (!c) return console.error(`[redirect] invalid screen "${screenId}"`);
-  c.navigate(url);
-}
-
-/* ─────────────────────────── State helpers ─────────────────────────────── */
-function loadState () {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
-  catch { return { hdmi1: null, hdmi2: null }; }
-}
-
-function saveState (state) {
-  try {
-    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    console.error('Could not write state file:', e);
-  }
-}
-
- 
-
-/* ───────────────── diagnostics (unchanged logic) ───────────────────────── */
-function getDiagnostics () {
-  /* … same implementation as before … */
-  function detectDeviceModel () {
-    try {
-      const piModel = fs.readFileSync('/proc/device-tree/model', 'utf8').trim();
-      if (piModel.length) return piModel;
-    } catch {}
+/* ───────────────── diagnostics helper ─────────────────────────────────── */
+function getDiagnostics() {
+  function detectModel() {
+    try { const m = fs.readFileSync('/proc/device-tree/model', 'utf8').trim(); if (m) return m; } catch { }
     const dmi = '/sys/devices/virtual/dmi/id';
     try {
-      const product = fs.readFileSync(path.join(dmi, 'product_name'), 'utf8').trim();
-      const version = fs.readFileSync(path.join(dmi, 'product_version'), 'utf8').trim();
-      const vendor  = fs.readFileSync(path.join(dmi, 'sys_vendor'), 'utf8').trim();
-      const parts = [vendor, product, version].filter(Boolean);
-      if (parts.length) return parts.join(' ');
-    } catch {}
-    try {
-      const out = execSync('hostnamectl', { encoding: 'utf8' });
-      const m = out.match(/Hardware Model:\s+(.+)/);
-      if (m) return m[1].trim();
-    } catch {}
-    try {
-      const cpu = os.cpus()?.[0]?.model?.trim();
-      if (cpu) return cpu;
-    } catch {}
+      const prod = fs.readFileSync(path.join(dmi, 'product_name'), 'utf8').trim();
+      const ver = fs.readFileSync(path.join(dmi, 'product_version'), 'utf8').trim();
+      const ven = fs.readFileSync(path.join(dmi, 'sys_vendor'), 'utf8').trim();
+      const parts = [ven, prod, ver].filter(Boolean); if (parts.length) return parts.join(' ');
+    } catch { }
     return 'unknown';
   }
-
-  const nets = os.networkInterfaces();
-  const ifaces = [];
-  for (const [name, arr] of Object.entries(nets)) {
-    for (const nic of arr) {
-      if (nic.family === 'IPv4' && !nic.internal) {
-        ifaces.push({ iface: name, ip: nic.address, mac: nic.mac });
-      }
-    }
-  }
-
+  const nets = os.networkInterfaces(), ifaces = [];
+  for (const [n, arr] of Object.entries(nets)) for (const nic of arr)
+    if (nic.family === 'IPv4' && !nic.internal) ifaces.push({ iface: n, ip: nic.address, mac: nic.mac });
   return {
     time: new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
-    hostname: os.hostname(),
-    arch: os.arch(),
-    deviceModel: detectDeviceModel(),
-    network: ifaces
+    hostname: os.hostname(), arch: os.arch(), deviceModel: detectModel(), network: ifaces
   };
 }
 
-/* ─────────────────────────── express setup ─────────────────────────────── */
-const app = express();
-app.use(express.json());
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-/* ---------- find a running Wayland socket even when we are root ---------- */
-function detectStack () {
-  // 1. Normal case: variables already present (started with sudo -E, etc.)
-  if (process.env.WAYLAND_DISPLAY && process.env.XDG_RUNTIME_DIR)
-    return 'wayland';
-
-  // 2. We are root.  Look under /run/user/*/wayland-* and grab the first hit.
-  //    This works because root can read every user's runtime dir.
+/* ───────────────── mouse-cursor helpers ───────────────────────────────── */
+function loadPointerState() { try { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); } catch { return { hidden: false }; } }
+function savePointerState(s) { try { fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true }); fs.writeFileSync(POINTER_FILE, JSON.stringify(s)); } catch (e) { console.error('[mouse] persist failed:', e); } }
+function isCursorHidden() { try { execSync('pgrep -u admin unclutter', { stdio: 'ignore' }); return true; } catch { return false; } }
+function hideCursor() {
   try {
-    const base = '/run/user';
-    for (const uid of fs.readdirSync(base)) {
-      const dir = path.join(base, uid);
-      for (const name of fs.readdirSync(dir)) {
-        if (name.startsWith('wayland-')) {
-          process.env.XDG_RUNTIME_DIR = dir;
-          process.env.WAYLAND_DISPLAY = name;
-          console.log(`[autoenv] using ${dir}/${name}`);
-          return 'wayland';
-        }
-      }
-    }
-  } catch { /* fall through */ }
-
-  // 3. As a last resort fall back to kmsgrab (root has CAP_SYS_ADMIN)
-  try { execSync('ffmpeg -hide_banner -devices | grep -q kmsgrab'); return 'kms'; }
-  catch {}
-
-  return 'unknown';
+    execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true', { stdio: 'ignore' });
+    spawn('sudo', ['-u', 'admin', 'DISPLAY=:0', 'XAUTHORITY=/home/admin/.Xauthority', 'unclutter', '-idle', '0', '-root'], { detached: true, stdio: 'ignore' }).unref();
+  } catch (e) { console.error('[mouse] hide failed:', e.message); }
 }
- /* ───────────────────────── Screen-resolution helper ────────────────────── */
-function readRes () {
+function showCursor() { try { execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true', { stdio: 'ignore' }); } catch (e) { console.error('[mouse] show failed:', e.message); } }
+(() => { const s = loadPointerState(), r = isCursorHidden(); if (s.hidden && !r) hideCursor(); if (!s.hidden && r) showCursor(); })();
+
+/* ───────────────────────── screenshot helper ──────────────────────────── */
+function readRes() {
   try {
     const out = execSync('xrandr', { encoding: 'utf8' });
-    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
+    const rx = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
     let m, map = {};
-    while ((m = rx.exec(out)) !== null) {
-      map[m[1]] = { w: +m[2], h: +m[3] };
-    }
+    while ((m = rx.exec(out)) !== null) map[m[1]] = { w: +m[2], h: +m[3] };
     const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
     const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
     return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
@@ -256,79 +179,31 @@ function readRes () {
   }
 }
 
-/* ─────────────── Wayland geometry helper (grim wants “x,y widthxheight”) ─ */
-function wlGeom ({ x, y, w, h }) {
-  return `${x},${y} ${w}x${h}`;
-}
+/* ───────────────────────── express setup ──────────────────────────────── */
+const app = express();
+app.use(express.json());
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
 
-/* ───────────────────── Find a usable /dev/dri/cardX for kmsgrab ────────── */
-function findDrmCard () {
-  try {
-    const dri = '/dev/dri';
-    for (const name of fs.readdirSync(dri)) {
-      if (name.startsWith('card')) {
-        const p = path.join(dri, name);
-        try { fs.accessSync(p, fs.constants.R_OK); return p; } catch {}
-      }
-    }
-  } catch {}
-  return null;          // none found or not readable
-}
-
-/* ────────────────────── Screenshot endpoint with fallbacks ─────────────── */
+/* ─────────────── screenshot endpoint (X11-only) ───────────────────────── */
+/* ───────── screenshot endpoint (X11-only but with resize/quality) ─────── */
 app.get('/screenshot/:id', (req, res) => {
-  const id = req.params.id;
-  const { w1, h1, w2, h2 } = readRes();
-
-  const geom = id === '1'
-    ? { x: 0,  y: 0,  w: w1, h: h1 }
-    : id === '2'
-    ? { x: w1, y: 0,  w: w2, h: h2 }
-    : null;
-
+  const id = req.params.id, { w1, h1, w2, h2 } = readRes();
+  const geom = id === '1' ? { x: 0,  y: 0,  w: w1, h: h1 }
+             : id === '2' ? { x: w1, y: 0,  w: w2, h: h2 }
+             : null;
   if (!geom) return res.status(400).send('invalid id');
 
-  const tmp   = `/tmp/screen${id}-${Date.now()}.png`;
-  const stack = detectStack();     // your existing helper
-  let cmd;
+  const tmp = `/tmp/screen${id}-${Date.now()}.png`;
+  const cmd = `ffmpeg -hide_banner -loglevel error -f x11grab -video_size ${geom.w}x${geom.h} ` +
+              `-i :0.0+${geom.x},${geom.y} -frames:v 1 -y ${tmp}`;
+  try { execSync(cmd, { stdio: 'inherit' }); }
+  catch (e) { console.error('[capture] x11grab failed:', e.message); return res.status(500).send('capture failed'); }
 
-/* -------- attempt 1: Wayland / grim ------------------------------------- */
-  if (stack === 'wayland') {
-    cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
-    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-    catch (e) { console.warn('[capture] grim failed:', e.message); }
-  }
-
-/* -------- attempt 2: DRM / kmsgrab -------------------------------------- */
-  const drm = findDrmCard();
-  if (drm) {
-    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device ${drm} `
-        + `-i - -frames:v 1 `
-        + `-vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
-    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-    catch (e) { console.warn('[capture] kmsgrab failed:', e.message); }
-  } else {
-    console.warn('[capture] no /dev/dri/cardX found, skipping kmsgrab');
-  }
-
-/* -------- attempt 3: X11 / x11grab -------------------------------------- */
-  cmd = `ffmpeg -hide_banner -loglevel error -f x11grab `
-      + `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} `
-      + `-frames:v 1 -y ${tmp}`;
-  try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-  catch (e) { console.error('[capture] x11grab failed:', e.message); }
-
-  return res.status(500).send('capture failed');
-
-/* ------------------------- helper: stream result ------------------------- */
- /* ------------------------- helper: stream result ------------------------- */
-function sendImage () {
-  const wantW = +req.query.maxw   || NaN;
+  /* optional convert to JPEG / resize (same flags as original) */
+  const wantW = +req.query.maxw || NaN;
   const wantQ = +req.query.quality || 90;
-
-  let file   = tmp;        // what we’ll actually send
-  let type   = 'png';      // MIME type
-  let extra  = null;       // second file to delete (jpg)
+  let outFile = tmp, mime = 'png';
 
   try {
     if (!Number.isNaN(wantW) || wantQ !== 90) {
@@ -338,223 +213,89 @@ function sendImage () {
         (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
         ` -quality ${wantQ} ${jpg}`
       );
-      file  = jpg;
-      extra = jpg;         // remember to delete it later
-      type  = 'jpeg';
+      outFile = jpg; mime = 'jpeg';
     }
-  } catch (e) {
-    console.warn('[capture] convert failed, falling back to PNG:', e.message);
-  }
+  } catch (e) { console.warn('[capture] convert failed, sending raw PNG:', e.message); }
 
-  // Stream the image to the client
-  res.type(type);
-  const stream = fs.createReadStream(file);
+  res.type(mime);
+  const stream = fs.createReadStream(outFile);
   stream.pipe(res);
 
-  // When the response is done (or aborted) - delete temp files
-  const cleanup = () => {
-    fs.unlink(tmp,  () => {});      // original PNG
-    if (extra) fs.unlink(extra, () => {});
-  };
-  res.once('finish', cleanup);
-  res.once('close',  cleanup);
-}
-
+  const clean = () => { fs.unlink(tmp, () => {}); if (outFile !== tmp) fs.unlink(outFile, () => {}); };
+  res.once('finish', clean); res.once('close', clean);
 });
 
- 
- 
 
-
-/* 2 ─ raw JSON diagnostics ------------------------------------------------- */
+/* ─────────────── diagnostics & UI ─────────────────────────────────────── */
 app.get('/diagnostic', (_, res) => res.json(getDiagnostics()));
-
-/* 3 ─ diagnostics UI ------------------------------------------------------- */
 app.get('/diagnostic-ui', (req, res) => {
-  const state  = loadState();
-  const screen = req.query.screen;
-  const target = screen === '1' ? state.hdmi1
-               : screen === '2' ? state.hdmi2
-               : null;
-
-  res.render('diagnostic-ui', {
-    d: getDiagnostics(),
-    urls: state,
-    target, screen
-  });
+  const state = loadState(), screen = req.query.screen;
+  const target = screen === '1' ? state.hdmi1 : screen === '2' ? state.hdmi2 : null;
+  res.render('diagnostic-ui', { d: getDiagnostics(), urls: state, target, screen });
 });
 
-/* 4 ─ reboot endpoint ------------------------------------------------------ */
-app.post('/reboot', (req, res) => {
+/* ─────────────── reboot endpoint ─────────────────────────────────────── */
+app.post('/reboot', (_req, res) => {
   res.send('Rebooting…');
-  setTimeout(() => {
-    spawn('sudo', ['reboot'], { stdio: 'ignore', detached: true }).unref();
-  }, 100);
+  setTimeout(() => spawn('sudo', ['reboot'], { stdio: 'ignore', detached: true }).unref(), 100);
 });
 
-/* saved-urls: GET returns state, POST updates AND refreshes screens -------- */
+/* ───────────── saved-urls endpoints ───────────────────────────────────── */
 app.get('/saved-urls', (_, res) => res.json(loadState()));
-
 app.post('/saved-urls', (req, res) => {
   const { hdmi1, hdmi2 } = req.body || {};
   const ok = v => typeof v === 'string' || v === null || typeof v === 'undefined';
   if (!ok(hdmi1) || !ok(hdmi2)) return res.status(400).send('hdmi1/hdmi2 bad type');
 
   const state = loadState();
-
-  if (typeof hdmi1 !== 'undefined') {
-    state.hdmi1 = hdmi1;
-    if (typeof hdmi1 === 'string' && hdmi1) redirectBrowser('1', hdmi1);
-  }
-  if (typeof hdmi2 !== 'undefined') {
-    state.hdmi2 = hdmi2;
-    if (typeof hdmi2 === 'string' && hdmi2) redirectBrowser('2', hdmi2);
-  }
-
+  if (typeof hdmi1 !== 'undefined') { state.hdmi1 = hdmi1; if (typeof hdmi1 === 'string' && hdmi1) redirectBrowser('1', hdmi1); }
+  if (typeof hdmi2 !== 'undefined') { state.hdmi2 = hdmi2; if (typeof hdmi2 === 'string' && hdmi2) redirectBrowser('2', hdmi2); }
   saveState(state);
+  announceUrls(state);          // push to hub
   res.json(state);
 });
 
-/* ────────────────────────── mouse-cursor helpers ───────────────────────── */
-
-/* 1. Persistent flag location */
-const POINTER_FILE = '/home/admin/kiosk/pointer.json';
-
-/* 2. Read / write helpers (best-effort, never throw) */
-function loadPointerState () {
-  try   { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); }
-  catch { return { hidden: false }; }
-}
-function savePointerState (state) {
-  try {
-    fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true });
-    fs.writeFileSync(POINTER_FILE, JSON.stringify(state));
-  } catch (e) {
-    console.error('[mouse] could not persist pointer state:', e);
-  }
-}
-
-/* 3. Runtime probe – checks if an unclutter process is running for admin   */
-function isCursorHidden () {
-  try {                                   // pgrep exits 0 if it finds a pid
-    execSync('pgrep -u admin unclutter', { stdio: 'ignore' });
-    return true;
-  } catch {                               // any error means not found / visible
-    return false;
-  }
-}
-
-/* 4. Hide and show commands (fast, no output noise)                        */
-function hideCursor () {
-  try {
-    execSync(
-      'sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true',
-      { stdio: 'ignore' }
-    );
-    /* start unclutter detached so server thread is not blocked */
-    spawn(
-      'sudo',
-      [
-        '-u', 'admin',
-        'DISPLAY=:0', 'XAUTHORITY=/home/admin/.Xauthority',
-        'unclutter', '-idle', '0', '-root'
-      ],
-      { detached: true, stdio: 'ignore' }
-    ).unref();
-  } catch (e) {
-    console.error('[mouse] hide failed:', e.message);
-  }
-}
-
-function showCursor () {
-  try {
-    execSync(
-      'sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true',
-      { stdio: 'ignore' }
-    );
-  } catch (e) {
-    console.error('[mouse] show failed:', e.message);
-  }
-}
-
-/* 5. Initialise persisted state once at boot                               */
-savePointerState({ hidden: isCursorHidden() });
-
-/* ────────────────────────── HTTP API endpoints ─────────────────────────── */
-
-/* Current status */
-app.get('/mouse', (_, res) => {
-  res.json({ hidden: isCursorHidden() });
-});
-
-/* Toggle */
+/* ───────────── mouse endpoints ────────────────────────────────────────── */
+app.get('/mouse', (_, res) => res.json(loadPointerState()));
 app.post('/mouse', (req, res) => {
-  const body   = req.body || {};
-  const target = body.hidden;
-
-  if (typeof target !== 'boolean')
-    return res.status(400).send('Expecting JSON body { "hidden": true|false }');
-
-  const currentlyHidden = isCursorHidden();
-
-  if (target && !currentlyHidden) hideCursor();
-  if (!target && currentlyHidden) showCursor();
-
-  /* update flag either way */
-  savePointerState({ hidden: target });
-
-  res.json({ hidden: target });
+  const { hidden } = req.body || {};
+  if (typeof hidden !== 'boolean') return res.status(400).send('Expecting JSON body { "hidden": true|false }');
+  const runtime = isCursorHidden();
+  if (hidden && !runtime) hideCursor();
+  if (!hidden && runtime) showCursor();
+  savePointerState({ hidden });
+  res.json({ hidden });
 });
 
- 
-/* ───────────────────── optional registration helper ────────────────────── */
-
-/** Return the first active, non-internal IPv4 interface (name + address). */
-function detectPrimaryIPv4 () {
-  for (const [name, nics] of Object.entries(os.networkInterfaces())) {
-    for (const nic of nics) {
-      if (nic.family === 'IPv4' && !nic.internal) {
-        return { name, ip: nic.address };
-      }
-    }
-  }
-  return null;            // nothing suitable found
+/* ───────────── registration (/data) + hub snapshot ────────────────────── */
+function detectPrimaryIPv4() {
+  for (const [name, nics] of Object.entries(os.networkInterfaces()))
+    for (const nic of nics) if (nic.family === 'IPv4' && !nic.internal) return { name, ip: nic.address };
+  return null;
 }
-
-/* Try to announce; on any failure wait 2 s and retry forever -------------- */
-function registerSelf () {
+function registerSelf() {
   const primary = detectPrimaryIPv4();
-  if (!primary) {
-    console.error('[register] no usable IPv4 interface');
-    return scheduleRetry();
-  }
+  if (!primary) { console.error('[register] no usable IPv4 interface'); return setTimeout(registerSelf, 2000); }
 
-  fetch('http://10.1.220.219:7070/data', {
-    method : 'POST',
+  /* original /data body – unchanged */
+  fetch(`${HUB}/data`, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body   : JSON.stringify({ ip_eth0: primary.ip })
+    body: JSON.stringify({ ip_eth0: primary.ip })
   })
-  .then(res => {
-    if (!res.ok) throw new Error('server responded ' + res.status);
-    console.log(`[register] announced ${primary.name} - ${primary.ip}`);
-    /* success: nothing else to do */
-  })
-  .catch(err => {
-    console.error('[register] failed:', err.message);
-    scheduleRetry();
-  });
+    .then(res => {
+      if (!res.ok) throw new Error('server responded ' + res.status);
+      console.log(`[register] announced ${primary.name} - ${primary.ip}`);
+    })
+    .catch(err => { console.error('[register] failed:', err.message); setTimeout(registerSelf, 2000); });
+
+  /* new full snapshot */
+  announceSelf();
 }
 
-/* Helper: retry after 2 s ------------------------------------------------- */
-function scheduleRetry () {
-  setTimeout(registerSelf, 2000);
-}
-
-
-/* ──────────────────────────── start server ─────────────────────────────── */
+/* ──────────────────────── start server ───────────────────────────────── */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
-
   const diag = `http://localhost:${PORT}/diagnostic-ui`;
   redirectBrowser('1', `${diag}?screen=1`);
   redirectBrowser('2', `${diag}?screen=2`);
