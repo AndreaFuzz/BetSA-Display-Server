@@ -152,18 +152,52 @@ function getDiagnostics() {
   };
 }
 
-/* ───────────────── mouse-cursor helpers ───────────────────────────────── */
-function loadPointerState() { try { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); } catch { return { hidden: false }; } }
-function savePointerState(s) { try { fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true }); fs.writeFileSync(POINTER_FILE, JSON.stringify(s)); } catch (e) { console.error('[mouse] persist failed:', e); } }
-function isCursorHidden() { try { execSync('pgrep -u admin unclutter', { stdio: 'ignore' }); return true; } catch { return false; } }
-function hideCursor() {
+/* ───────────────── mouse-cursor helpers ──────────────────────────────── */
+ 
+const INIT_FILE    = '/home/admin/kiosk/pointer.init';   // written after 1st POST
+
+function loadPointerState () {
+  try { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); }
+  catch { return { hidden: false }; }
+}
+function savePointerState (s) {
+  try {
+    fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true });
+    fs.writeFileSync(POINTER_FILE, JSON.stringify(s));
+    /* first successful save → write sentinel so future boots honor pointer.json */
+    if (!fs.existsSync(INIT_FILE)) fs.writeFileSync(INIT_FILE, 'done');
+  } catch (e) { console.error('[mouse] persist failed:', e); }
+}
+function isCursorHidden () {
+  try { execSync('pgrep -u admin unclutter', { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+function hideCursor () {
   try {
     execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true', { stdio: 'ignore' });
-    spawn('sudo', ['-u', 'admin', 'DISPLAY=:0', 'XAUTHORITY=/home/admin/.Xauthority', 'unclutter', '-idle', '0', '-root'], { detached: true, stdio: 'ignore' }).unref();
-  } catch (e) { console.error('[mouse] hide failed:', e.message); }
+    spawn(
+      'sudo',
+      ['-u','admin','DISPLAY=:0','XAUTHORITY=/home/admin/.Xauthority',
+       'unclutter','-idle','0','-root'],
+      { detached: true, stdio: 'ignore' }
+    ).unref();
+  } catch (e) { console.error('[mouse] hide failed:', e); }
 }
-function showCursor() { try { execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true', { stdio: 'ignore' }); } catch (e) { console.error('[mouse] show failed:', e.message); } }
-(() => { const s = loadPointerState(), r = isCursorHidden(); if (s.hidden && !r) hideCursor(); if (!s.hidden && r) showCursor(); })();
+function showCursor () {
+  try { execSync('sudo -u admin DISPLAY=:0 XAUTHORITY=/home/admin/.Xauthority pkill unclutter || true', { stdio: 'ignore' }); }
+  catch (e) { console.error('[mouse] show failed:', e); }
+}
+
+/* initialisation -------------------------------------------------------- */
+(() => {
+  const firstBoot = !fs.existsSync(INIT_FILE);           // new sentinel check
+  const state     = firstBoot ? { hidden: true } : loadPointerState();
+  const actuallyHidden = isCursorHidden();
+
+  if (state.hidden && !actuallyHidden) hideCursor();
+  if (!state.hidden && actuallyHidden) showCursor();
+})();
+ 
 
 /* ───────────────────────── screenshot helper ──────────────────────────── */
 function readRes() {
@@ -187,7 +221,7 @@ app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
- 
+  
 /* ─────────────── screenshot endpoint – works on all stacks ───────────── */
 /* ────────────────────────── screen-capture helpers ───────────────────── */
 
