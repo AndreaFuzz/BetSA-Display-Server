@@ -61,7 +61,24 @@ function readVersion () {
 }
 
 function writeVersion (num) {
-  fs.writeFileSync(VERSION_FILE, String(num), 'utf8');
+  const data = String(num);
+
+  try {
+    /* fast path: write with current privileges */
+    fs.writeFileSync(VERSION_FILE, data, 'utf8');
+    return;
+  } catch (e) {
+    if (e.code !== 'EACCES') throw e;          // real error → re-throw
+    console.warn(`[upgrade] no permission to write ${VERSION_FILE}; retrying with sudo`);
+  }
+
+  /* fallback: echo … | sudo tee FILE  */
+  const cmd = `echo '${data.replace(/'/g, "'\\''")}' | sudo tee '${VERSION_FILE}' >/dev/null`;
+  const res = spawnSync('bash', ['-c', cmd], { stdio: 'inherit' });
+
+  if (res.status !== 0) {
+    throw new Error(`sudo tee failed (exit ${res.status})`);
+  }
 }
 
 function listScripts () {
