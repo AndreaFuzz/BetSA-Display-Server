@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- configuration -------------------------------------------------
-TARGET="/usr/local/bin/betsa-launch-chrome.sh"
-LOG="/var/log/betsa-migration-1.log"
+# ---------------- configuration -----------------------------------------
+TARGET="/usr/local/bin/betsa-launch-chrome.sh"           # file to patch
+LOG_DIR="/opt/betsa-display-screens/log"                 # preferred log dir
+FALLBACK_DIR="/tmp"                                      # fallback if needed
 
-# -------- logging setup -------------------------------------------------
-mkdir -p "$(dirname "$LOG")"
-touch "$LOG"
+# ---------------- logging setup -----------------------------------------
+if mkdir -p "$LOG_DIR" 2>/dev/null; then
+  LOG="$LOG_DIR/betsa-migration-1.log"
+else
+  LOG="$FALLBACK_DIR/betsa-migration-1.log"
+fi
+
+touch "$LOG" 2>/dev/null || LOG="/dev/null"              # last-ditch fallback
 exec > >(tee -a "$LOG") 2>&1
 
 echo "[$(date '+%F %T')] --- Migration 1: remove --incognito flag ---"
 
-# -------- sanity checks -------------------------------------------------
+# ---------------- sanity checks -----------------------------------------
 if [ ! -f "$TARGET" ]; then
   echo "ERROR: target file $TARGET not found"
   exit 1
 fi
 
-# -------- do the work ---------------------------------------------------
+# ---------------- do the work ------------------------------------------
 if grep -q -- '--incognito' "$TARGET"; then
   echo "Flag found; creating backup"
   cp "$TARGET" "${TARGET}.bak.$(date '+%Y%m%d_%H%M%S')"
@@ -31,7 +37,7 @@ else
   echo "No --incognito flag present; nothing to do"
 fi
 
-# -------- verification --------------------------------------------------
+# ---------------- verification ------------------------------------------
 if grep -q -- '--incognito' "$TARGET"; then
   echo "ERROR: flag still present after attempted removal"
   exit 1
