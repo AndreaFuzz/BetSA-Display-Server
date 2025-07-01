@@ -59,7 +59,7 @@ function announceSelf() {
   });
 }
 function announceUrls(urls) { postToHub('/device/urls', { mac: DEVICE_MAC, urls }); }
-//change
+
 /* ───────────────── DevTools auto-reconnect controller ─────────────────── */
 function fetchJson(port) {
   return new Promise((res, rej) => {
@@ -181,51 +181,158 @@ function readRes() {
   }
 }
 
-
 /* ───────────────────────── express setup ──────────────────────────────── */
 const app = express();
 app.use(express.json());
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-/* ─────────────── screenshot endpoint (X11-only) ───────────────────────── */
-/* ───────── screenshot endpoint (X11-only but with resize/quality) ─────── */
+ 
+/* ─────────────── screenshot endpoint – works on all stacks ───────────── */
+/* ────────────────────────── screen-capture helpers ───────────────────── */
+
+/* 1. Resolution of the two HDMI heads (unchanged) */
+function readRes () {
+  try {
+    const out = execSync('xrandr', { encoding: 'utf8' });
+    const rx  = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)/gm;
+    let m, map = {};
+    while ((m = rx.exec(out)) !== null) map[m[1]] = { w: +m[2], h: +m[3] };
+    const h1 = map['HDMI-1'] || { w: 1920, h: 1080 };
+    const h2 = map['HDMI-2'] || { w: 1920, h: 1080 };
+    return { w1: h1.w, h1: h1.h, w2: h2.w, h2: h2.h };
+  } catch {
+    console.error('readRes failed, defaulting 1920x1080 per screen');
+    return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
+  }
+}
+
+/* 2. Which display stack are we running under? */
+function detectStack () {
+  /* already running under a user account that exported the vars */
+  if (process.env.WAYLAND_DISPLAY && process.env.XDG_RUNTIME_DIR)
+    return 'wayland';
+
+  /* running as root: walk /run/user/* for a wayland-* socket */
+  try {
+    const base = '/run/user';
+    for (const uid of fs.readdirSync(base)) {
+      const dir = path.join(base, uid);
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith('wayland-')) {
+          process.env.XDG_RUNTIME_DIR = dir;
+          process.env.WAYLAND_DISPLAY = name;
+          console.log(`[autoenv] using ${dir}/${name}`);
+          return 'wayland';
+        }
+      }
+    }
+  } catch {/* fall through */ }
+
+  /* last resort: if ffmpeg reports kmsgrab support we can grab /dev/dri */
+  try { execSync('ffmpeg -hide_banner -devices | grep -q kmsgrab'); return 'kms'; }
+  catch {/* fall through */ }
+
+  return 'unknown';
+}
+
+/* 3. Build a grim geometry string "x,y widthxheight" for wayland */
+function wlGeom ({ x, y, w, h }) {
+  return `${x},${y} ${w}x${h}`;
+}
+
+/* 4. Find a readable /dev/dri/cardX for kmsgrab */
+function findDrmCard () {
+  try {
+    for (const name of fs.readdirSync('/dev/dri')) {
+      if (name.startsWith('card')) {
+        const p = '/dev/dri/' + name;
+        try { fs.accessSync(p, fs.constants.R_OK); return p; } catch {}
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/* ─────────────── screenshot endpoint – works on all stacks ───────────── */
 app.get('/screenshot/:id', (req, res) => {
-  const id = req.params.id, { w1, h1, w2, h2 } = readRes();
+
+  /* which half of the desktop? */
+  const id            = req.params.id;
+  const { w1, h1, w2, h2 } = readRes();
   const geom = id === '1' ? { x: 0,  y: 0,  w: w1, h: h1 }
              : id === '2' ? { x: w1, y: 0,  w: w2, h: h2 }
              : null;
   if (!geom) return res.status(400).send('invalid id');
 
-  const tmp = `/tmp/screen${id}-${Date.now()}.png`;
-  const cmd = `ffmpeg -hide_banner -loglevel error -f x11grab -video_size ${geom.w}x${geom.h} ` +
-              `-i :0.0+${geom.x},${geom.y} -frames:v 1 -y ${tmp}`;
-  try { execSync(cmd, { stdio: 'inherit' }); }
-  catch (e) { console.error('[capture] x11grab failed:', e.message); return res.status(500).send('capture failed'); }
+  const tmp   = `/tmp/screen${id}-${Date.now()}.png`;
+  const stack = detectStack();
+  let   cmd;
 
-  /* optional convert to JPEG / resize (same flags as original) */
-  const wantW = +req.query.maxw || NaN;
-  const wantQ = +req.query.quality || 90;
-  let outFile = tmp, mime = 'png';
+  /* ---- attempt 1 : Wayland -> grim ------------------------------------ */
+  if (stack === 'wayland') {
+    cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] grim failed:', e.message); }
+  }
 
-  try {
-    if (!Number.isNaN(wantW) || wantQ !== 90) {
-      const jpg = tmp.replace(/\.png$/, '.jpg');
-      execSync(
-        `convert ${tmp}` +
-        (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
-        ` -quality ${wantQ} ${jpg}`
-      );
-      outFile = jpg; mime = 'jpeg';
+  /* ---- attempt 2 : kernel DRM -> ffmpeg kmsgrab ------------------------ */
+  const drm = findDrmCard();
+  if (drm) {
+    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device ${drm} `
+        + `-i - -frames:v 1 `
+        + `-vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] kmsgrab failed:', e.message); }
+  } else {
+    console.warn('[capture] no /dev/dri/cardX found, skipping kmsgrab');
+  }
+
+  /* ---- attempt 3 : X11 -> ffmpeg x11grab ------------------------------- */
+  cmd = `ffmpeg -hide_banner -loglevel error -f x11grab `
+      + `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} `
+      + `-frames:v 1 -y ${tmp}`;
+  try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+  catch (e) {
+    console.error('[capture] x11grab failed:', e.message);
+    return res.status(500).send('capture failed');
+  }
+
+  /* ---- helper that streams (optionally resized) image to client -------- */
+  function sendImage () {
+    const wantW = +req.query.maxw   || NaN;   // ?maxw=800
+    const wantQ = +req.query.quality || 90;   // ?quality=80
+    let   file  = tmp;
+    let   type  = 'png';
+    let   extra = null;
+
+    try {
+      if (!Number.isNaN(wantW) || wantQ !== 90) {
+        const jpg = tmp.replace(/\.png$/, '.jpg');
+        execSync(
+          `convert ${tmp}` +
+          (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
+          ` -quality ${wantQ} ${jpg}`
+        );
+        file  = jpg;
+        extra = jpg;
+        type  = 'jpeg';
+      }
+    } catch (e) {
+      console.warn('[capture] convert failed, sending raw PNG:', e.message);
     }
-  } catch (e) { console.warn('[capture] convert failed, sending raw PNG:', e.message); }
 
-  res.type(mime);
-  const stream = fs.createReadStream(outFile);
-  stream.pipe(res);
+    res.type(type);
+    const stream = fs.createReadStream(file);
+    stream.pipe(res);
 
-  const clean = () => { fs.unlink(tmp, () => {}); if (outFile !== tmp) fs.unlink(outFile, () => {}); };
-  res.once('finish', clean); res.once('close', clean);
+    const cleanup = () => {
+      fs.unlink(tmp, () => {});
+      if (extra) fs.unlink(extra, () => {});
+    };
+    res.once('finish', cleanup);
+    res.once('close',  cleanup);
+  }
 });
 
 
