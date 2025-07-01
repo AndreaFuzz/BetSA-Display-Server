@@ -1,4 +1,4 @@
-// upgrade.js ─ simple on-disk migration runner for .sh scripts (root-safe)
+// upgrade.js ─ migration runner for .sh scripts (filesystem-agnostic)
 /* eslint-disable no-console */
 'use strict';
 
@@ -13,9 +13,16 @@ const MIGRATIONS_DIR = path.resolve(__dirname, 'migrations');   // 1.sh, 2.sh �
 /* === PUBLIC API ======================================================= */
 module.exports = { runMigrations, getVersion };
 
+/**
+ * Run any .sh scripts in the migrations directory that have a higher
+ * numeric name than the recorded version. Each script is invoked with bash;
+ * after a successful exit the version file is bumped.
+ */
 function runMigrations () {
   const current = readVersion();
-  const pending = listScripts().filter(v => v > current).sort((a, b) => a - b);
+  const pending = listScripts()
+                   .filter(v => v > current)
+                   .sort((a, b) => a - b);
 
   if (pending.length === 0) {
     console.log(`[upgrade] already at version ${current} – nothing to do`);
@@ -28,49 +35,41 @@ function runMigrations () {
     const script = path.join(MIGRATIONS_DIR, `${v}.sh`);
     console.log(`[upgrade] running ${script}`);
 
-    try { ensureExecutable(script); }
-    catch (e) { console.error(`[upgrade] chmod +x failed: ${e.message}`); break; }
-
-    const res = spawnSync(script, { stdio: 'inherit', shell: false });
+    const res = spawnSync('bash', [script], { stdio: 'inherit' });
 
     if (res.status === 0) {
       writeVersion(v);
       console.log(`[upgrade] -> success, version set to ${v}`);
     } else {
       console.error(`[upgrade] -> FAILED with exit code ${res.status}`);
+      console.error('[upgrade] aborting further migrations');
       break;
     }
   }
 }
 
-/* --------------- NEW tiny helper exported above ---------------------- */
+/* expose current version to other modules */
 function getVersion () {
-  return readVersion();           // just read the file and return the number
+  return readVersion();
 }
 
-/* === INTERNAL HELPERS (unchanged) ===================================== */
+/* === INTERNAL HELPERS ================================================= */
 function readVersion () {
   try { return parseInt(fs.readFileSync(VERSION_FILE, 'utf8'), 10) || 0; }
-  catch { return 0; }
+  catch { return 0; }                 // file missing or unreadable
 }
 
-function writeVersion (num) { fs.writeFileSync(VERSION_FILE, String(num), 'utf8'); }
+function writeVersion (num) {
+  fs.writeFileSync(VERSION_FILE, String(num), 'utf8');
+}
 
 function listScripts () {
   try {
     return fs.readdirSync(MIGRATIONS_DIR)
              .filter(f => /^[0-9]+\.sh$/.test(f))
-             .map(f => parseInt(f, 10));
+             .map(f => parseInt(f, 10));           // parseInt stops at first non-digit
   } catch (e) {
-    if (e.code === 'ENOENT') return [];
+    if (e.code === 'ENOENT') return [];            // no migrations dir yet
     throw e;
-  }
-}
-
-function ensureExecutable (file) {
-  const mode = fs.statSync(file).mode & 0o777;
-  if ((mode & 0o111) !== 0o111) {
-    fs.chmodSync(file, mode | 0o755);
-    console.log(`[upgrade] chmod +x ${file}`);
   }
 }
