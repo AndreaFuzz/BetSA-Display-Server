@@ -35,7 +35,8 @@ function runMigrations () {
     const script = path.join(MIGRATIONS_DIR, `${v}.sh`);
     console.log(`[upgrade] running ${script}`);
 
-    const res = spawnSync('bash', [script], { stdio: 'inherit' });
+ 
+    const res = spawnSync('sudo', ['bash', script], { stdio: 'inherit' });
 
     if (res.status === 0) {
       writeVersion(v);
