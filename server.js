@@ -1,6 +1,10 @@
 /* server.js ─ BETSA kiosk helper with EJS diagnostics UI & auto-reconnecting DevTools */
 /* eslint-disable no-console */
 'use strict';
+const upgrade = require('./upgrade');
+upgrade.runMigrations();                 // already there
+const APP_VERSION = upgrade.getVersion(); // new – read the number
+
 
 const express = require('express');
 const fs = require('fs');
@@ -373,10 +377,21 @@ app.get('/screenshot/:id', (req, res) => {
 /* ─────────────── diagnostics & UI ─────────────────────────────────────── */
 app.get('/diagnostic', (_, res) => res.json(getDiagnostics()));
 app.get('/diagnostic-ui', (req, res) => {
-  const state = loadState(), screen = req.query.screen;
-  const target = screen === '1' ? state.hdmi1 : screen === '2' ? state.hdmi2 : null;
-  res.render('diagnostic-ui', { d: getDiagnostics(), urls: state, target, screen });
+  const state  = loadState();
+  const screen = req.query.screen;
+  const target = screen === '1' ? state.hdmi1
+               : screen === '2' ? state.hdmi2
+               : null;
+
+  res.render('diagnostic-ui', {
+    d: getDiagnostics(),
+    urls: state,
+    target,
+    screen,
+    version: APP_VERSION
+  });
 });
+
 
 /* ─────────────── reboot endpoint ─────────────────────────────────────── */
 app.post('/reboot', (_req, res) => {
