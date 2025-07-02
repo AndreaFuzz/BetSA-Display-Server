@@ -161,16 +161,24 @@ function getDiagnostics() {
 const INIT_FILE    = '/home/admin/kiosk/pointer.init';   // written after 1st POST
 
 function loadPointerState () {
-  try { return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8')); }
-  catch { return { hidden: false }; }
+  /*  BEFORE any manual setting, report "hidden": true               */
+  if (!fs.existsSync(INIT_FILE)) return { hidden: true };
+
+  try {                        // after first POST we can trust pointer.json
+    return JSON.parse(fs.readFileSync(POINTER_FILE, 'utf8'));
+  } catch {
+    return { hidden: false };  // corrupted JSON? fall back to visible
+  }
 }
+
 function savePointerState (s) {
   try {
     fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true });
     fs.writeFileSync(POINTER_FILE, JSON.stringify(s));
-    /* first successful save → write sentinel so future boots honor pointer.json */
     if (!fs.existsSync(INIT_FILE)) fs.writeFileSync(INIT_FILE, 'done');
-  } catch (e) { console.error('[mouse] persist failed:', e); }
+  } catch (e) {
+    console.error('[mouse] persist failed:', e);
+  }
 }
 function isCursorHidden () {
   try { execSync('pgrep -u admin unclutter', { stdio: 'ignore' }); return true; }
