@@ -252,62 +252,132 @@ function readRes () {
     return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
   }
 }
-  
-   
-/* ─────────────── screenshot endpoint – rock-solid version ───────────── */
+ 
+/* 2. Which display stack are we running under? */
+function detectStack () {
+  /* already running under a user account that exported the vars */
+  if (process.env.WAYLAND_DISPLAY && process.env.XDG_RUNTIME_DIR)
+    return 'wayland';
+
+  /* running as root: walk /run/user/* for a wayland-* socket */
+  try {
+    const base = '/run/user';
+    for (const uid of fs.readdirSync(base)) {
+      const dir = path.join(base, uid);
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith('wayland-')) {
+          process.env.XDG_RUNTIME_DIR = dir;
+          process.env.WAYLAND_DISPLAY = name;
+          console.log(`[autoenv] using ${dir}/${name}`);
+          return 'wayland';
+        }
+      }
+    }
+  } catch {/* fall through */ }
+
+  /* last resort: if ffmpeg reports kmsgrab support we can grab /dev/dri */
+  try { execSync('ffmpeg -hide_banner -devices | grep -q kmsgrab'); return 'kms'; }
+  catch {/* fall through */ }
+
+  return 'unknown';
+}
+
+/* 3. Build a grim geometry string "x,y widthxheight" for wayland */
+function wlGeom ({ x, y, w, h }) {
+  return `${x},${y} ${w}x${h}`;
+}
+
+/* 4. Find a readable /dev/dri/cardX for kmsgrab */
+function findDrmCard () {
+  try {
+    for (const name of fs.readdirSync('/dev/dri')) {
+      if (name.startsWith('card')) {
+        const p = '/dev/dri/' + name;
+        try { fs.accessSync(p, fs.constants.R_OK); return p; } catch {}
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/* ─────────────── screenshot endpoint – works on all stacks ───────────── */
 app.get('/screenshot/:id', (req, res) => {
 
-  /* 1. Which half of the desktop do we want? */
-  const id   = req.params.id;
+  /* which half of the desktop? */
+  const id            = req.params.id;
   const { w1, h1, w2, h2 } = readRes();
-  const geom = id === '1'
-    ? { x: 0,  y: 0,  w: w1, h: h1 }
-    : id === '2'
-    ? { x: w1, y: 0,  w: w2, h: h2 }
-    : null;
+  const geom = id === '1' ? { x: 0,  y: 0,  w: w1, h: h1 }
+             : id === '2' ? { x: w1, y: 0,  w: w2, h: h2 }
+             : null;
   if (!geom) return res.status(400).send('invalid id');
 
-  /* 2. Output tuning – override with ?maxw= & ?quality= */
-  const wantW   = +req.query.maxw    || Math.floor(geom.w / 2); /* default: half width */
-  const quality = +req.query.quality || 85;                     /* default: JPEG 85%   */
+  const tmp   = `/tmp/screen${id}-${Date.now()}.png`;
+  const stack = detectStack();
+  let   cmd;
 
-  /* 3. Capture one PNG frame to /tmp */
-  const png = `/tmp/screen${id}-${Date.now()}.png`;
-  try {
-    
-      /* X11 everywhere (incl. Intel / Pi / AMD) → ffmpeg → PNG */
-      execSync(
-        `ffmpeg -hide_banner -loglevel error -f x11grab ` +
-        `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} ` +
-        `-frames:v 1 -y "${png}"`
-      );
-    
-  } catch (e) {
-    console.error('[capture] failed:', e.message);
+  /* ---- attempt 1 : Wayland -> grim ------------------------------------ */
+  if (stack === 'wayland') {
+    cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] grim failed:', e.message); }
+  }
+
+  /* ---- attempt 2 : kernel DRM -> ffmpeg kmsgrab ------------------------ */
+  const drm = findDrmCard();
+  if (drm) {
+    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device ${drm} `
+        + `-i - -frames:v 1 `
+        + `-vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
+    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+    catch (e) { console.warn('[capture] kmsgrab failed:', e.message); }
+  } else {
+    console.warn('[capture] no /dev/dri/cardX found, skipping kmsgrab');
+  }
+
+  /* ---- attempt 3 : X11 -> ffmpeg x11grab ------------------------------- */
+  cmd = `ffmpeg -hide_banner -loglevel error -f x11grab `
+      + `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} `
+      + `-frames:v 1 -y ${tmp}`;
+  try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
+  catch (e) {
+    console.error('[capture] x11grab failed:', e.message);
     return res.status(500).send('capture failed');
   }
 
-  /* 4. Resize + compress with ImageMagick convert */
-  const jpg = png.replace(/\.png$/, '.jpg');
-  try {
-    execSync(
-      `convert "${png}" -resize ${wantW} ` +
-      `-sampling-factor 4:2:0 -strip -quality ${quality} "${jpg}"`
-    );
-  } catch (e) {
-    console.error('[convert] failed:', e.message);
-    /* fall back to raw PNG if convert failed */
-    res.type('png');
-    return fs.createReadStream(png).pipe(res).once('close', cleanup).once('finish', cleanup);
-  }
+  /* ---- helper that streams (optionally resized) image to client -------- */
+  function sendImage () {
+    const wantW = +req.query.maxw   || NaN;   // ?maxw=800
+    const wantQ = +req.query.quality || 90;   // ?quality=80
+    let   file  = tmp;
+    let   type  = 'png';
+    let   extra = null;
 
-  /* 5. Stream JPEG back, then clean up tmp files */
-  res.type('jpeg');
-  fs.createReadStream(jpg).pipe(res).once('close', cleanup).once('finish', cleanup);
+    try {
+      if (!Number.isNaN(wantW) || wantQ !== 90) {
+        const jpg = tmp.replace(/\.png$/, '.jpg');
+        execSync(
+          `convert ${tmp}` +
+          (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
+          ` -quality ${wantQ} ${jpg}`
+        );
+        file  = jpg;
+        extra = jpg;
+        type  = 'jpeg';
+      }
+    } catch (e) {
+      console.warn('[capture] convert failed, sending raw PNG:', e.message);
+    }
 
-  function cleanup () {
-    fs.unlink(png, () => {});
-    fs.unlink(jpg, () => {});
+    res.type(type);
+    const stream = fs.createReadStream(file);
+    stream.pipe(res);
+
+    const cleanup = () => {
+      fs.unlink(tmp, () => {});
+      if (extra) fs.unlink(extra, () => {});
+    };
+    res.once('finish', cleanup);
+    res.once('close',  cleanup);
   }
 });
 
