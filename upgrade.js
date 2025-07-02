@@ -1,4 +1,4 @@
-// upgrade.js ─ migration runner for .sh scripts (filesystem-agnostic)
+// upgrade.js ─ platform-aware migration runner
 /* eslint-disable no-console */
 'use strict';
 
@@ -6,19 +6,30 @@ const fs   = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-/* === CONFIGURATION ==================================================== */
-const VERSION_FILE   = path.resolve(__dirname, '.app_version'); // plain text
-const MIGRATIONS_DIR = path.resolve(__dirname, 'migrations');   // 1.sh, 2.sh …
+/* === PLATFORM DETECTION ============================================== */
+function isRaspberryPi () {
+  try {
+    const model = fs.readFileSync('/proc/device-tree/model', 'utf8').toLowerCase();
+    return model.includes('raspberry pi');
+  } catch {
+    return false;                       // file absent on non-Pi hardware
+  }
+}
+const PLATFORM       = isRaspberryPi() ? 'pi' : 'intel';
+const MIGRATIONS_DIR = path.resolve(__dirname, 'migrations', PLATFORM);
+const VERSION_FILE   = path.resolve(__dirname, '.app_version');
 
 /* === PUBLIC API ======================================================= */
 module.exports = { runMigrations, getVersion };
 
 /**
- * Run any .sh scripts in the migrations directory that have a higher
- * numeric name than the recorded version. Each script is invoked with bash;
- * after a successful exit the version file is bumped.
+ * Run any *.sh scripts in the platform-specific migrations directory
+ * whose numeric name is higher than the recorded version.
  */
 function runMigrations () {
+  console.log(`[upgrade] platform detected: ${PLATFORM}`);
+  console.log(`[upgrade] migration path:    ${MIGRATIONS_DIR}`);
+
   const current = readVersion();
   const pending = listScripts()
                    .filter(v => v > current)
@@ -35,7 +46,6 @@ function runMigrations () {
     const script = path.join(MIGRATIONS_DIR, `${v}.sh`);
     console.log(`[upgrade] running ${script}`);
 
- 
     const res = spawnSync('sudo', ['bash', script], { stdio: 'inherit' });
 
     if (res.status === 0) {
@@ -49,45 +59,38 @@ function runMigrations () {
   }
 }
 
-/* expose current version to other modules */
-function getVersion () {
-  return readVersion();
-}
+/* expose current version */
+function getVersion () { return readVersion(); }
 
 /* === INTERNAL HELPERS ================================================= */
 function readVersion () {
   try { return parseInt(fs.readFileSync(VERSION_FILE, 'utf8'), 10) || 0; }
-  catch { return 0; }                 // file missing or unreadable
+  catch { return 0; }
 }
 
 function writeVersion (num) {
   const data = String(num);
 
   try {
-    /* fast path: write with current privileges */
     fs.writeFileSync(VERSION_FILE, data, 'utf8');
     return;
   } catch (e) {
-    if (e.code !== 'EACCES') throw e;          // real error → re-throw
+    if (e.code !== 'EACCES') throw e;
     console.warn(`[upgrade] no permission to write ${VERSION_FILE}; retrying with sudo`);
   }
 
-  /* fallback: echo … | sudo tee FILE  */
   const cmd = `echo '${data.replace(/'/g, "'\\''")}' | sudo tee '${VERSION_FILE}' >/dev/null`;
   const res = spawnSync('bash', ['-c', cmd], { stdio: 'inherit' });
-
-  if (res.status !== 0) {
-    throw new Error(`sudo tee failed (exit ${res.status})`);
-  }
+  if (res.status !== 0) throw new Error(`sudo tee failed (exit ${res.status})`);
 }
 
 function listScripts () {
   try {
     return fs.readdirSync(MIGRATIONS_DIR)
              .filter(f => /^[0-9]+\.sh$/.test(f))
-             .map(f => parseInt(f, 10));           // parseInt stops at first non-digit
+             .map(f => parseInt(f, 10));
   } catch (e) {
-    if (e.code === 'ENOENT') return [];            // no migrations dir yet
+    if (e.code === 'ENOENT') return [];          // no dir yet → no scripts
     throw e;
   }
 }
