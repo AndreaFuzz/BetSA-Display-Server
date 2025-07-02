@@ -289,97 +289,76 @@ function wlGeom ({ x, y, w, h }) {
 
 /* 4. Find a readable /dev/dri/cardX for kmsgrab */
 function findDrmCard () {
+  // Pi’s card presents but cannot be kmsgrab-ed.
+  // Detect that case once and pretend “no card”.
+  try {
+    const model = fs.readFileSync('/proc/device-tree/model', 'utf8');
+    if (/Raspberry Pi/i.test(model)) return null;       // <-- NEW
+  } catch {/* ignore */}
   try {
     for (const name of fs.readdirSync('/dev/dri')) {
       if (name.startsWith('card')) {
         const p = '/dev/dri/' + name;
-        try { fs.accessSync(p, fs.constants.R_OK); return p; } catch {}
+        fs.accessSync(p, fs.constants.R_OK);
+        return p;
       }
     }
-  } catch {}
+  } catch {/* no card */}
   return null;
 }
+   
 
-/* ─────────────── screenshot endpoint – works on all stacks ───────────── */
+ 
+/* ─────────────── screenshot endpoint – fast, smaller JPEG ───────────── */
 app.get('/screenshot/:id', (req, res) => {
-
-  /* which half of the desktop? */
-  const id            = req.params.id;
+  /* Which half of the desktop? */
+  const id   = req.params.id;
   const { w1, h1, w2, h2 } = readRes();
-  const geom = id === '1' ? { x: 0,  y: 0,  w: w1, h: h1 }
-             : id === '2' ? { x: w1, y: 0,  w: w2, h: h2 }
-             : null;
+  const geom = id === '1'
+    ? { x: 0,  y: 0,  w: w1, h: h1 }
+    : id === '2'
+    ? { x: w1, y: 0,  w: w2, h: h2 }
+    : null;
   if (!geom) return res.status(400).send('invalid id');
 
-  const tmp   = `/tmp/screen${id}-${Date.now()}.png`;
-  const stack = detectStack();
-  let   cmd;
+  /* Compression knobs (override with ?maxw=&quality= in the URL) */
+  const wantW = +req.query.maxw    || null;  // pixels wide; null → half-size
+  const q     = +req.query.quality || 5;     // 1–31, lower = higher quality
 
-  /* ---- attempt 1 : Wayland -> grim ------------------------------------ */
-  if (stack === 'wayland') {
-    cmd = `grim -g "${wlGeom(geom)}" ${tmp}`;
-    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-    catch (e) { console.warn('[capture] grim failed:', e.message); }
-  }
+  const buildScale = () =>
+    wantW
+      ? `scale='if(gt(iw,${wantW}),${wantW},iw):-1'`
+      : 'scale=iw/2:ih/2';                   // default: 50 % resolution
 
-  /* ---- attempt 2 : kernel DRM -> ffmpeg kmsgrab ------------------------ */
-  const drm = findDrmCard();
-  if (drm) {
-    cmd = `ffmpeg -hide_banner -loglevel error -f kmsgrab -device ${drm} `
-        + `-i - -frames:v 1 `
-        + `-vf "crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}" -y ${tmp}`;
-    try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-    catch (e) { console.warn('[capture] kmsgrab failed:', e.message); }
-  } else {
-    console.warn('[capture] no /dev/dri/cardX found, skipping kmsgrab');
-  }
+   
 
-  /* ---- attempt 3 : X11 -> ffmpeg x11grab ------------------------------- */
-  cmd = `ffmpeg -hide_banner -loglevel error -f x11grab `
-      + `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} `
-      + `-frames:v 1 -y ${tmp}`;
-  try { execSync(cmd, { stdio: 'inherit' }); return sendImage(); }
-  catch (e) {
-    console.error('[capture] x11grab failed:', e.message);
-    return res.status(500).send('capture failed');
-  }
+  /* ---------- X11 / KMS path ---------- */
+  const drm  = findDrmCard();
+  const grab = drm
+    ? ['-f','kmsgrab','-device',drm,'-i','-',
+       '-vf', `crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}`]
+    : ['-f','x11grab',
+       '-video_size', `${geom.w}x${geom.h}`,
+       '-i', `:0.0+${geom.x},${geom.y}`];
 
-  /* ---- helper that streams (optionally resized) image to client -------- */
-  function sendImage () {
-    const wantW = +req.query.maxw   || NaN;   // ?maxw=800
-    const wantQ = +req.query.quality || 90;   // ?quality=80
-    let   file  = tmp;
-    let   type  = 'png';
-    let   extra = null;
+  const ffArgs = [
+    '-hide_banner', '-loglevel', 'error',
+    ...grab,
+    '-frames:v', '1',
+    '-vf', `${buildScale()},format=yuv420p`,
+    '-q:v', String(q),
+    '-f', 'mjpeg', 'pipe:1'
+  ];
 
-    try {
-      if (!Number.isNaN(wantW) || wantQ !== 90) {
-        const jpg = tmp.replace(/\.png$/, '.jpg');
-        execSync(
-          `convert ${tmp}` +
-          (!Number.isNaN(wantW) ? ` -resize ${wantW}` : '') +
-          ` -quality ${wantQ} ${jpg}`
-        );
-        file  = jpg;
-        extra = jpg;
-        type  = 'jpeg';
-      }
-    } catch (e) {
-      console.warn('[capture] convert failed, sending raw PNG:', e.message);
-    }
-
-    res.type(type);
-    const stream = fs.createReadStream(file);
-    stream.pipe(res);
-
-    const cleanup = () => {
-      fs.unlink(tmp, () => {});
-      if (extra) fs.unlink(extra, () => {});
-    };
-    res.once('finish', cleanup);
-    res.once('close',  cleanup);
-  }
+  const ff = spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
+  res.type('jpeg');
+  ff.stdout.pipe(res);
+  ff.on('exit', code => {
+    if (code !== 0) res.destroy(new Error('ffmpeg failed'));
+  });
 });
+
+
 
 
 /* ─────────────── diagnostics & UI ─────────────────────────────────────── */
