@@ -252,66 +252,12 @@ function readRes () {
     return { w1: 1920, h1: 1080, w2: 1920, h2: 1080 };
   }
 }
-
-/* 2. Which display stack are we running under? */
-function detectStack () {
-  /* already running under a user account that exported the vars */
-  if (process.env.WAYLAND_DISPLAY && process.env.XDG_RUNTIME_DIR)
-    return 'wayland';
-
-  /* running as root: walk /run/user/* for a wayland-* socket */
-  try {
-    const base = '/run/user';
-    for (const uid of fs.readdirSync(base)) {
-      const dir = path.join(base, uid);
-      for (const name of fs.readdirSync(dir)) {
-        if (name.startsWith('wayland-')) {
-          process.env.XDG_RUNTIME_DIR = dir;
-          process.env.WAYLAND_DISPLAY = name;
-          console.log(`[autoenv] using ${dir}/${name}`);
-          return 'wayland';
-        }
-      }
-    }
-  } catch {/* fall through */ }
-
-  /* last resort: if ffmpeg reports kmsgrab support we can grab /dev/dri */
-  try { execSync('ffmpeg -hide_banner -devices | grep -q kmsgrab'); return 'kms'; }
-  catch {/* fall through */ }
-
-  return 'unknown';
-}
-
-/* 3. Build a grim geometry string "x,y widthxheight" for wayland */
-function wlGeom ({ x, y, w, h }) {
-  return `${x},${y} ${w}x${h}`;
-}
-
-/* 4. Find a readable /dev/dri/cardX for kmsgrab */
-function findDrmCard () {
-  // Pi’s card presents but cannot be kmsgrab-ed.
-  // Detect that case once and pretend “no card”.
-  try {
-    const model = fs.readFileSync('/proc/device-tree/model', 'utf8');
-    if (/Raspberry Pi/i.test(model)) return null;       // <-- NEW
-  } catch {/* ignore */}
-  try {
-    for (const name of fs.readdirSync('/dev/dri')) {
-      if (name.startsWith('card')) {
-        const p = '/dev/dri/' + name;
-        fs.accessSync(p, fs.constants.R_OK);
-        return p;
-      }
-    }
-  } catch {/* no card */}
-  return null;
-}
+  
    
-
- 
-/* ─────────────── screenshot endpoint – fast, smaller JPEG ───────────── */
+/* ─────────────── screenshot endpoint – rock-solid version ───────────── */
 app.get('/screenshot/:id', (req, res) => {
-  /* Which half of the desktop? */
+
+  /* 1. Which half of the desktop do we want? */
   const id   = req.params.id;
   const { w1, h1, w2, h2 } = readRes();
   const geom = id === '1'
@@ -321,41 +267,48 @@ app.get('/screenshot/:id', (req, res) => {
     : null;
   if (!geom) return res.status(400).send('invalid id');
 
-  /* Compression knobs (override with ?maxw=&quality= in the URL) */
-  const wantW = +req.query.maxw    || null;  // pixels wide; null → half-size
-  const q     = +req.query.quality || 5;     // 1–31, lower = higher quality
+  /* 2. Output tuning – override with ?maxw= & ?quality= */
+  const wantW   = +req.query.maxw    || Math.floor(geom.w / 2); /* default: half width */
+  const quality = +req.query.quality || 85;                     /* default: JPEG 85%   */
 
-  const buildScale = () =>
-    wantW
-      ? `scale='if(gt(iw,${wantW}),${wantW},iw):-1'`
-      : 'scale=iw/2:ih/2';                   // default: 50 % resolution
+  /* 3. Capture one PNG frame to /tmp */
+  const png = `/tmp/screen${id}-${Date.now()}.png`;
+  try {
+    
+      /* X11 everywhere (incl. Intel / Pi / AMD) → ffmpeg → PNG */
+      execSync(
+        `ffmpeg -hide_banner -loglevel error -f x11grab ` +
+        `-video_size ${geom.w}x${geom.h} -i :0.0+${geom.x},${geom.y} ` +
+        `-frames:v 1 -y "${png}"`
+      );
+    
+  } catch (e) {
+    console.error('[capture] failed:', e.message);
+    return res.status(500).send('capture failed');
+  }
 
-   
+  /* 4. Resize + compress with ImageMagick convert */
+  const jpg = png.replace(/\.png$/, '.jpg');
+  try {
+    execSync(
+      `convert "${png}" -resize ${wantW} ` +
+      `-sampling-factor 4:2:0 -strip -quality ${quality} "${jpg}"`
+    );
+  } catch (e) {
+    console.error('[convert] failed:', e.message);
+    /* fall back to raw PNG if convert failed */
+    res.type('png');
+    return fs.createReadStream(png).pipe(res).once('close', cleanup).once('finish', cleanup);
+  }
 
-  /* ---------- X11 / KMS path ---------- */
-  const drm  = findDrmCard();
-  const grab = drm
-    ? ['-f','kmsgrab','-device',drm,'-i','-',
-       '-vf', `crop=${geom.w}:${geom.h}:${geom.x}:${geom.y}`]
-    : ['-f','x11grab',
-       '-video_size', `${geom.w}x${geom.h}`,
-       '-i', `:0.0+${geom.x},${geom.y}`];
-
-  const ffArgs = [
-    '-hide_banner', '-loglevel', 'error',
-    ...grab,
-    '-frames:v', '1',
-    '-vf', `${buildScale()},format=yuv420p`,
-    '-q:v', String(q),
-    '-f', 'mjpeg', 'pipe:1'
-  ];
-
-  const ff = spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'pipe', 'inherit'] });
+  /* 5. Stream JPEG back, then clean up tmp files */
   res.type('jpeg');
-  ff.stdout.pipe(res);
-  ff.on('exit', code => {
-    if (code !== 0) res.destroy(new Error('ffmpeg failed'));
-  });
+  fs.createReadStream(jpg).pipe(res).once('close', cleanup).once('finish', cleanup);
+
+  function cleanup () {
+    fs.unlink(png, () => {});
+    fs.unlink(jpg, () => {});
+  }
 });
 
 
