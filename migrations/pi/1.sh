@@ -18,11 +18,10 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "[$(date '+%F %T')] --- Migration 1: remove --incognito flag ---"
 
-# ---------------- handle missing file -----------------------------------
+# ---------------- sanity checks -----------------------------------------
 if [ ! -f "$TARGET" ]; then
-  echo "Target file $TARGET not found; nothing to migrate."
-  echo "Migration 1 completed successfully (no changes required)"
-  exit 0
+  echo "ERROR: target file $TARGET not found"
+  exit 1
 fi
 
 # ---------------- do the work ------------------------------------------
