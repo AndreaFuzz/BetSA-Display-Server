@@ -5,7 +5,7 @@ const upgrade = require('./upgrade');
 upgrade.runMigrations();                 // already there
 const APP_VERSION = upgrade.getVersion(); // new – read the number
 
-
+const ANNOUNCE_INTERVAL = 10 * 60 * 1000;   // 10 minutes
 const express = require('express');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
@@ -473,4 +473,5 @@ app.listen(PORT, () => {
   redirectBrowser('1', `${diag}?screen=1`);
   redirectBrowser('2', `${diag}?screen=2`);
   registerSelf();
+  setInterval(announceSelf, ANNOUNCE_INTERVAL);
 });
