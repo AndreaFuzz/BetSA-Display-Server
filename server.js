@@ -447,48 +447,47 @@ app.post('/mouse', (req, res) => {
  *  Network-domain “clear” commands.  Resolves when the commands have been
  *  sent and the socket closed.  Throws on any failure along the way.
  */
-function clearCookiesAndCache (port) {
+/* ─── Clear everything and refresh ───────────────────────────────────── */
+function clearCookiesCacheAndRefresh (port) {
   return new Promise(async (resolve, reject) => {
     try {
-      const list  = await fetchJson(port);
-      const page  = list.find(t => t.type === 'page');
-      if (!page)  return reject(new Error('no "page" target'));
+      const list = await fetchJson(port);
+      const page = list.find(t => t.type === 'page');
+      if (!page) return reject(new Error('no "page" target found'));
 
-      const ws    = new WebSocket(page.webSocketDebuggerUrl);
-      let   id    = 0;
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      let id = 0;
+      const send = (method, params = {}) =>
+        ws.send(JSON.stringify({ id: ++id, method, params }));
 
       ws.once('open', () => {
-        const send = (method, params = {}) =>
-          ws.send(JSON.stringify({ id: ++id, method, params }));
-
-        send('Network.clearBrowserCookies');   // 🔑 wipe all cookies
-        send('Network.clearBrowserCache');     // 🗑️  flush HTTP cache
-
-        /* Give Chrome a moment to process, then close the socket */
-        setTimeout(() => { ws.close(); resolve(); }, 300);
+        send('Network.clearBrowserCookies');   // delete all cookies
+        send('Network.clearBrowserCache');     // empty HTTP cache
+        send('Page.reload', { ignoreCache: true }); // hard-refresh tab
+        setTimeout(() => { ws.close(); resolve(); }, 500);
       });
+
       ws.once('error', err => { ws.close(); reject(err); });
     } catch (err) { reject(err); }
   });
 }
 
+
 /* POST /clear-cookies/1   or   POST /clear-cookies/2
    -------------------------------------------------- */
 app.post('/clear-cookies/:id', async (req, res) => {
-  const id   = req.params.id;              // "1" or "2"
-  const port = SCREEN_PORT[id];
-
+  const port = SCREEN_PORT[req.params.id];
   if (!port) return res.status(400).send('invalid HDMI id');
 
   try {
-    await clearCookiesAndCache(port);
-    res.send(`Cookies & cache cleared for HDMI-${id}`);
-    console.log(`[cookies] cleared for HDMI-${id} (${port})`);
+    await clearCookiesCacheAndRefresh(port);
+    res.send(`Cookies, cache cleared **and page reloaded** for HDMI-${req.params.id}`);
   } catch (e) {
-    console.error(`[cookies] HDMI-${id} failed:`, e.message);
+    console.error(`[cookies] HDMI-${req.params.id} failed:`, e.message);
     res.status(500).send(`failed: ${e.message}`);
   }
 });
+
 
 
 /* ───────────── registration (/data) + hub snapshot ────────────────────── */
