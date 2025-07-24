@@ -488,6 +488,93 @@ app.post('/clear-cookies/:id', async (req, res) => {
   }
 });
 
+/* ──────────────── live console logs over SSE ─────────────────────────── */
+/*
+   GET /console[/<id>]
+
+   – If <id> is 1 or 2, streams that HDMI head only.
+   – With no <id>, it multiplexes both heads.
+   – Each SSE message is a JSON object, e.g.
+       {"screen":1,"kind":"console","type":"log","text":"hello","ts":1721830123456}
+       {"screen":2,"kind":"browser","level":"error","text":"404","ts":...}
+
+   Clients:  curl -N http://localhost:8080/console
+             curl -N http://localhost:8080/console/1
+*/
+app.get('/console/:id?', (req, res) => {
+  /* pick which ports we’ll tap */
+  const want = (() => {
+    const id = req.params.id;
+    if (id === '1' || id === '2') return [[id, SCREEN_PORT[id]]];
+    return Object.entries(SCREEN_PORT);          // both
+  })();
+
+  /* standard SSE headers */
+  res.writeHead(200, {
+    'Content-Type':  'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection:      'keep-alive',
+  });
+  res.flushHeaders();
+  const send = obj => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+
+  /* helper to establish a WebSocket to the page target on one port */
+  function wire(screen, port) {
+    /* discover the page target */
+    fetchJson(port)
+      .then(list => {
+        const page = list.find(t => t.type === 'page');
+        if (!page) throw new Error('no “page” target');
+        const ws = new WebSocket(page.webSocketDebuggerUrl);
+        let msgId = 0;
+        const sendCmd = (method, params = {}) =>
+          ws.send(JSON.stringify({ id: ++msgId, method, params }));
+
+        ws.on('open', () => {
+          sendCmd('Runtime.enable');   // console.* events
+          sendCmd('Log.enable');       // browser log events
+        });
+
+        ws.on('message', data => {
+          try { data = JSON.parse(data); } catch { return; }
+
+          /* console.* */
+          if (data.method === 'Runtime.consoleAPICalled') {
+            const { type, args } = data.params;
+            send({
+              screen, kind: 'console', type,
+              text: args.map(a => a.value ?? a.description).join(' '),
+              ts: Date.now()
+            });
+          }
+
+          /* network / browser */
+          if (data.method === 'Log.entryAdded') {
+            const { entry } = data.params;
+            send({
+              screen, kind: 'browser',
+              level: entry.level, source: entry.source, text: entry.text,
+              ts: entry.timestamp
+            });
+          }
+        });
+
+        ws.on('close',  () => send({ screen, kind: 'status', text: 'closed' }));
+        ws.on('error',  e => send({ screen, kind: 'error',  text: e.message }));
+        req.on('close', () => ws.close());
+      })
+      .catch(err => {
+        send({ screen, kind: 'error', text: `connect failed: ${err.message}` });
+      });
+  }
+
+  /* connect to every requested screen */
+  want.forEach(([scr, port]) => wire(Number(scr), port));
+
+  /* keep‑alive ping every 30 s so proxies don’t cut the pipe */
+  const ping = setInterval(() => res.write(': ping\n\n'), 30000);
+  req.on('close', () => clearInterval(ping));
+});
 
 
 /* ───────────── registration (/data) + hub snapshot ────────────────────── */
