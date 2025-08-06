@@ -223,7 +223,7 @@ app.set('views', path.join(__dirname, 'views'));
 /* replace the whole /screenshot/:id handler */
 app.get("/screenshot/:id", async (req, res) => {
   try {
-    const { mime, buffer } = await captureScreenshot(req.params.id, 70); // 70 % JPEG
+    const { mime, buffer } = await captureScreenshot(req.params.id, 30);  
     res.type(mime).send(buffer);
   } catch (err) {
     res.status(500).send(err.message);

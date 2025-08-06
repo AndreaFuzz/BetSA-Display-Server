@@ -115,7 +115,7 @@ async function compress (pngPath, quality) {
     const meta = await img.metadata();
     const buf  = await img
       // two-thirds of the original width
-      .resize({ width: Math.round(meta.width * 2 / 3) })
+      .resize({ width: Math.round(meta.width / 2) })
       .jpeg({ quality })
       .toBuffer();
     fs.unlink(pngPath, () => {});
