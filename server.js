@@ -19,6 +19,7 @@ const { captureScreenshot } = require("./screenshot");
 const PORT = 8080;                          // HTTP API / UI port
 const STATE_FILE = '/home/admin/kiosk/urls.json'; // persistent store for HDMI URLs
 const POINTER_FILE = '/home/admin/kiosk/pointer.json';
+const { getLatestPatch } = require("./patch-info");
 
 const SCREEN_PORT = { '1': 9222, '2': 9223 };      // HDMI-1 / HDMI-2 debug ports
 const HUB = 'http://10.1.220.219:7070';    // central server
@@ -135,26 +136,44 @@ function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8
 function saveState(s) { try { fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true }); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch (e) { console.error('Could not write state:', e); } }
 
 /* ───────────────── diagnostics helper ─────────────────────────────────── */
+/* ───────────────── diagnostics helper ─────────────────────────────────── */
 function getDiagnostics() {
   function detectModel() {
-    try { const m = fs.readFileSync('/proc/device-tree/model', 'utf8').trim(); if (m) return m; } catch { }
-    const dmi = '/sys/devices/virtual/dmi/id';
     try {
-      const prod = fs.readFileSync(path.join(dmi, 'product_name'), 'utf8').trim();
-      const ver = fs.readFileSync(path.join(dmi, 'product_version'), 'utf8').trim();
-      const ven = fs.readFileSync(path.join(dmi, 'sys_vendor'), 'utf8').trim();
-      const parts = [ven, prod, ver].filter(Boolean); if (parts.length) return parts.join(' ');
-    } catch { }
-    return 'unknown';
+      const m = fs.readFileSync("/proc/device-tree/model", "utf8").trim();
+      if (m) return m;
+    } catch {}
+    const dmi = "/sys/devices/virtual/dmi/id";
+    try {
+      const prod = fs.readFileSync(path.join(dmi, "product_name"),  "utf8").trim();
+      const ver  = fs.readFileSync(path.join(dmi, "product_version"), "utf8").trim();
+      const ven  = fs.readFileSync(path.join(dmi, "sys_vendor"), "utf8").trim();
+      const parts = [ven, prod, ver].filter(Boolean);
+      if (parts.length) return parts.join(" ");
+    } catch {}
+    return "unknown";
   }
-  const nets = os.networkInterfaces(), ifaces = [];
-  for (const [n, arr] of Object.entries(nets)) for (const nic of arr)
-    if (nic.family === 'IPv4' && !nic.internal) ifaces.push({ iface: n, ip: nic.address, mac: nic.mac });
+
+  const nets = os.networkInterfaces();
+  const ifaces = [];
+  for (const [n, arr] of Object.entries(nets)) {
+    for (const nic of arr) {
+      if (nic.family === "IPv4" && !nic.internal) {
+        ifaces.push({ iface: n, ip: nic.address, mac: nic.mac });
+      }
+    }
+  }
+
   return {
-    time: new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
-    hostname: os.hostname(), arch: os.arch(), deviceModel: detectModel(), network: ifaces
+    time: new Date().toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }),
+    hostname: os.hostname(),
+    arch: os.arch(),
+    deviceModel: detectModel(),
+    network: ifaces,
+    patch: getLatestPatch()         
   };
 }
+
 
 /* ───────────────── mouse-cursor helpers ──────────────────────────────── */
  
