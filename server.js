@@ -5,7 +5,7 @@ const upgrade = require("./upgrade");
 upgrade.runMigrations();
 const APP_VERSION = upgrade.getVersion();
 
-const ANNOUNCE_INTERVAL = 10 * 60 * 1000;   // 10 minutes (keep drift via setInterval)
+const ANNOUNCE_INTERVAL = 10 * 60 * 1000;   // 10 minutes drift-based
 const express = require("express");
 const fs = require("fs");
 const { execSync, spawn } = require("child_process");
@@ -17,15 +17,14 @@ const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 const { captureScreenshot } = require("./screenshot");
 const { getLatestPatch } = require("./patch-info");
 
-/* ---------------------------------------------------------------------- */
-const PORT = 8080;                               // HTTP API / UI port
+const PORT = 8080;
 const STATE_FILE = "/home/admin/kiosk/urls.json";
 const POINTER_FILE = "/home/admin/kiosk/pointer.json";
 const SCREEN_PORT = { "1": 9222, "2": 9223 };
 const HUB = "http://10.1.220.219:7070";
-/* ---------------------------------------------------------------------- */
 
-/* Small helper: fetch with timeout and slight jitter */
+/* ---------------------------------------------------------------------- */
+/* fetch helper with timeout and jitter */
 function fetchWithTimeout(url, opts = {}, timeoutMs = 10000) {
   const AC = global.AbortController || (() => { throw new Error("AbortController missing"); });
   let controller;
@@ -35,10 +34,27 @@ function fetchWithTimeout(url, opts = {}, timeoutMs = 10000) {
   return fetch(url, merged).finally(() => clearTimeout(id));
 }
 
-/* ------------------------------ hub helpers ---------------------------- */
+/* choose live primary NIC + MAC each announce */
+function detectPrimaryIPv4() {
+  for (const [name, nics] of Object.entries(os.networkInterfaces())) {
+    for (const nic of nics) {
+      if (nic && nic.family === "IPv4" && !nic.internal) {
+        return { name, ip: nic.address, mac: nic.mac };
+      }
+    }
+  }
+  return null;
+}
+function currentMac() {
+  const p = detectPrimaryIPv4();
+  if (p && p.mac && p.mac !== "00:00:00:00:00:00") return p.mac;
+  return "unknown";
+}
+
+/* ---------------------------------------------------------------------- */
+/* announce helpers */
 function postToHub(path, payload, delay = 2000) {
-  // add small jitter so devices do not stampede at the same time
-  const jitter = Math.floor(Math.random() * 400); // 0-400ms
+  const jitter = Math.floor(Math.random() * 400); // spread load
   fetchWithTimeout(`${HUB}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -52,24 +68,6 @@ function postToHub(path, payload, delay = 2000) {
       console.error(`[hub] POST ${path} failed: ${err.message}`);
       setTimeout(() => postToHub(path, payload, Math.min(delay * 2, 60000)), delay + jitter);
     });
-}
-
-/* Choose the live primary IPv4 and its MAC each time (avoids stale data) */
-function detectPrimaryIPv4() {
-  for (const [name, nics] of Object.entries(os.networkInterfaces())) {
-    for (const nic of nics) {
-      if (nic && nic.family === "IPv4" && !nic.internal) {
-        return { name, ip: nic.address, mac: nic.mac };
-      }
-    }
-  }
-  return null;
-}
-
-function currentMac() {
-  const p = detectPrimaryIPv4();
-  if (p && p.mac && p.mac !== "00:00:00:00:00:00") return p.mac;
-  return "unknown";
 }
 
 function announceMouse(hidden) {
@@ -92,7 +90,8 @@ function announceUrls(urls) {
   postToHub("/device/urls", { mac, urls });
 }
 
-/* ---------------- DevTools auto-reconnect controller ------------------- */
+/* ---------------------------------------------------------------------- */
+/* DevTools auto-reconnect */
 function fetchJson(port) {
   return new Promise((res, rej) => {
     http.get({ host: "127.0.0.1", port, path: "/json" }, r => {
@@ -159,7 +158,8 @@ const controllers = {};
 for (const [id, port] of Object.entries(SCREEN_PORT)) controllers[id] = new DevToolsController(id, port);
 function redirectBrowser(id, url) { const c = controllers[id]; if (c) c.navigate(url); }
 
-/* ----------------------------- state helpers ---------------------------- */
+/* ---------------------------------------------------------------------- */
+/* state helpers */
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); }
   catch { return { hdmi1: null, hdmi2: null }; }
@@ -171,7 +171,7 @@ function saveState(s) {
   } catch (e) { console.error("Could not write state:", e); }
 }
 
-/* --------------------------- diagnostics helper ------------------------- */
+/* diagnostics helper */
 function getDiagnostics() {
   function detectModel() {
     try {
@@ -209,15 +209,14 @@ function getDiagnostics() {
   };
 }
 
-/* --------------------------- mouse-cursor helpers ----------------------- */
+/* ---------------------------------------------------------------------- */
+/* mouse helpers */
 const INIT_FILE = "/home/admin/kiosk/pointer.init";
-
 function loadPointerState() {
   if (!fs.existsSync(INIT_FILE)) return { hidden: true };
   try { return JSON.parse(fs.readFileSync(POINTER_FILE, "utf8")); }
   catch { return { hidden: false }; }
 }
-
 function savePointerState(s) {
   try {
     fs.mkdirSync(path.dirname(POINTER_FILE), { recursive: true });
@@ -225,7 +224,6 @@ function savePointerState(s) {
     if (!fs.existsSync(INIT_FILE)) fs.writeFileSync(INIT_FILE, "done");
   } catch (e) { console.error("[mouse] persist failed:", e); }
 }
-
 function isCursorHidden() {
   try { execSync("pgrep -u admin unclutter", { stdio: "ignore" }); return true; }
   catch { return false; }
@@ -250,18 +248,17 @@ function showCursor() {
   const firstBoot = !fs.existsSync(INIT_FILE);
   const state = firstBoot ? { hidden: true } : loadPointerState();
   const actuallyHidden = isCursorHidden();
-
   if (state.hidden && !actuallyHidden) hideCursor();
   if (!state.hidden && actuallyHidden) showCursor();
 })();
 
-/* ----------------------------- express setup ---------------------------- */
+/* ---------------------------------------------------------------------- */
+/* express app + routes */
 const app = express();
 app.use(express.json());
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 
-/* screenshot */
 app.get("/screenshot/:id", async (req, res) => {
   try {
     const { mime, buffer } = await captureScreenshot(req.params.id, 30);
@@ -269,7 +266,6 @@ app.get("/screenshot/:id", async (req, res) => {
   } catch (err) { res.status(500).send(err.message); }
 });
 
-/* diagnostics & UI */
 app.get("/diagnostic", (_, res) => res.json(getDiagnostics()));
 app.get("/diagnostic-ui", (req, res) => {
   const state  = loadState();
@@ -277,7 +273,6 @@ app.get("/diagnostic-ui", (req, res) => {
   const target = screen === "1" ? state.hdmi1
                : screen === "2" ? state.hdmi2
                : null;
-
   res.render("diagnostic-ui", {
     d: getDiagnostics(),
     urls: state,
@@ -287,19 +282,16 @@ app.get("/diagnostic-ui", (req, res) => {
   });
 });
 
-/* reboot */
 app.post("/reboot", (_req, res) => {
   res.send("Rebooting...");
   setTimeout(() => spawn("sudo", ["reboot"], { stdio: "ignore", detached: true }).unref(), 100);
 });
 
-/* saved-urls */
 app.get("/saved-urls", (_, res) => res.json(loadState()));
 app.post("/saved-urls", (req, res) => {
   const { hdmi1, hdmi2 } = req.body || {};
   const ok = v => typeof v === "string" || v === null || typeof v === "undefined";
   if (!ok(hdmi1) || !ok(hdmi2)) return res.status(400).send("hdmi1/hdmi2 bad type");
-
   const state = loadState();
   if (typeof hdmi1 !== "undefined") { state.hdmi1 = hdmi1; if (typeof hdmi1 === "string" && hdmi1) redirectBrowser("1", hdmi1); }
   if (typeof hdmi2 !== "undefined") { state.hdmi2 = hdmi2; if (typeof hdmi2 === "string" && hdmi2) redirectBrowser("2", hdmi2); }
@@ -308,50 +300,41 @@ app.post("/saved-urls", (req, res) => {
   res.json(state);
 });
 
-/* mouse */
 app.get("/mouse", (_, res) => res.json(loadPointerState()));
 app.post("/mouse", (req, res) => {
   const { hidden } = req.body || {};
-  if (typeof hidden !== "boolean")
-    return res.status(400).send('Expecting JSON body { "hidden": true|false }');
-
+  if (typeof hidden !== "boolean") return res.status(400).send('Expecting JSON body { "hidden": true|false }');
   const wasHidden = isCursorHidden();
   if (hidden && !wasHidden) hideCursor();
   if (!hidden && wasHidden) showCursor();
-
   savePointerState({ hidden });
   announceMouse(hidden);
   res.json({ hidden });
 });
 
-/* clear cookies/cache and reload */
+/* clear cookies/cache/reload */
 function clearCookiesCacheAndRefresh(port) {
   return new Promise(async (resolve, reject) => {
     try {
       const list = await fetchJson(port);
       const page = list.find(t => t.type === "page");
       if (!page) return reject(new Error('no "page" target found'));
-
       const ws = new WebSocket(page.webSocketDebuggerUrl);
       let id = 0;
       const send = (method, params = {}) => ws.send(JSON.stringify({ id: ++id, method, params }));
-
       ws.once("open", () => {
         send("Network.clearBrowserCookies");
         send("Network.clearBrowserCache");
         send("Page.reload", { ignoreCache: true });
         setTimeout(() => { ws.close(); resolve(); }, 500);
       });
-
       ws.once("error", err => { ws.close(); reject(err); });
     } catch (err) { reject(err); }
   });
 }
-
 app.post("/clear-cookies/:id", async (req, res) => {
   const port = SCREEN_PORT[req.params.id];
   if (!port) return res.status(400).send("invalid HDMI id");
-
   try {
     await clearCookiesCacheAndRefresh(port);
     res.send(`Cookies, cache cleared and page reloaded for HDMI-${req.params.id}`);
@@ -361,14 +344,13 @@ app.post("/clear-cookies/:id", async (req, res) => {
   }
 });
 
-/* live console logs over SSE */
+/* live console logs over SSE (unchanged) */
 app.get("/console/:id?", (req, res) => {
   const want = (() => {
     const id = req.params.id;
     if (id === "1" || id === "2") return [[id, SCREEN_PORT[id]]];
     return Object.entries(SCREEN_PORT);
   })();
-
   res.writeHead(200, {
     "Content-Type":  "text/event-stream",
     "Cache-Control": "no-cache",
@@ -376,7 +358,6 @@ app.get("/console/:id?", (req, res) => {
   });
   res.flushHeaders();
   const send = obj => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-
   function wire(screen, port) {
     fetchJson(port)
       .then(list => {
@@ -385,15 +366,12 @@ app.get("/console/:id?", (req, res) => {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
         let msgId = 0;
         const sendCmd = (method, params = {}) => ws.send(JSON.stringify({ id: ++msgId, method, params }));
-
         ws.on("open", () => {
           sendCmd("Runtime.enable");
           sendCmd("Log.enable");
         });
-
         ws.on("message", data => {
           try { data = JSON.parse(data); } catch { return; }
-
           if (data.method === "Runtime.consoleAPICalled") {
             const { type, args } = data.params;
             send({
@@ -402,7 +380,6 @@ app.get("/console/:id?", (req, res) => {
               ts: Date.now()
             });
           }
-
           if (data.method === "Log.entryAdded") {
             const { entry } = data.params;
             send({
@@ -412,54 +389,24 @@ app.get("/console/:id?", (req, res) => {
             });
           }
         });
-
         ws.on("close",  () => send({ screen, kind: "status", text: "closed" }));
         ws.on("error",  e => send({ screen, kind: "error",  text: e.message }));
         req.on("close", () => ws.close());
       })
-      .catch(err => {
-        send({ screen, kind: "error", text: `connect failed: ${err.message}` });
-      });
+      .catch(err => { send({ screen, kind: "error", text: `connect failed: ${err.message}` }); });
   }
-
   want.forEach(([scr, port]) => wire(Number(scr), port));
   const ping = setInterval(() => res.write(": ping\n\n"), 30000);
   req.on("close", () => clearInterval(ping));
 });
 
-/* registration and periodic announce */
-function registerSelf() {
-  const primary = detectPrimaryIPv4();
-  if (!primary) {
-    console.error("[register] no usable IPv4 interface");
-    return setTimeout(registerSelf, 2000);
-  }
-
-  // Use fetchWithTimeout so a hang does not block future announces
-  fetchWithTimeout(`${HUB}/data`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ip_eth0: primary.ip })
-  }, 8000)
-    .then(res => {
-      if (!res.ok) throw new Error("server responded " + res.status);
-      console.log(`[register] announced ${primary.name} - ${primary.ip}`);
-    })
-    .catch(err => {
-      console.error("[register] failed:", err.message);
-      setTimeout(registerSelf, 2000);
-    });
-
-  announceSelf();
-}
-
+/* ---------------------------------------------------------------------- */
 /* start server */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
   const diag = `http://localhost:${PORT}/diagnostic-ui`;
   redirectBrowser("1", `${diag}?screen=1`);
   redirectBrowser("2", `${diag}?screen=2`);
-  registerSelf();
-  // keep drift-based interval (spreads load naturally)
-  setInterval(announceSelf, ANNOUNCE_INTERVAL);
+  announceSelf(); // announce immediately
+  setInterval(announceSelf, ANNOUNCE_INTERVAL); // keep drift
 });
