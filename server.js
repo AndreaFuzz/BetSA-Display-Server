@@ -16,6 +16,7 @@ const WebSocket = require("ws");
 const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 const { captureScreenshot } = require("./screenshot");
 const { getLatestPatch } = require("./patch-info");
+const autopatch = require("./auto-patch");
 
 const PORT = 8080;
 const STATE_FILE = "/home/admin/kiosk/urls.json";
@@ -343,6 +344,21 @@ app.post("/clear-cookies/:id", async (req, res) => {
     res.status(500).send(`failed: ${e.message}`);
   }
 });
+// Manual trigger: GET /autopatch/check
+app.get("/autopatch/check", (req, res) => {
+  if (autopatch.isBusy()) {
+    res.status(202).send("autopatch already running");
+    return;
+  }
+  const vt = req.query.vt ? Number(req.query.vt) : undefined; // e.g. /autopatch/check?vt=3
+
+  // fire-and-forget
+  autopatch.checkAndApply({ vt })
+    .then(r => console.log(`[autopatch] completed: ${JSON.stringify(r)}`))
+    .catch(err => console.error("[autopatch] failed:", err));
+
+  res.status(202).send("autopatch started in background");
+});
 
 /* live console logs over SSE (unchanged) */
 app.get("/console/:id?", (req, res) => {
@@ -404,9 +420,16 @@ app.get("/console/:id?", (req, res) => {
 /* start server */
 app.listen(PORT, () => {
   console.log(`kiosk-server listening on ${PORT}`);
+  
   const diag = `http://localhost:${PORT}/diagnostic-ui`;
   redirectBrowser("1", `${diag}?screen=1`);
   redirectBrowser("2", `${diag}?screen=2`);
+ 
+  const primary = detectPrimaryIPv4();
+  const ip = primary && primary.ip;
+  const minute = autopatch.startNightlyStagger(ip, { hour: 20, tz: "Africa/Johannesburg" });
+  console.log(`[autopatch] stagger minute for ${ip || "unknown"}: ${minute}`);
+  
   announceSelf(); // announce immediately
   setInterval(announceSelf, ANNOUNCE_INTERVAL); // keep drift
 });
