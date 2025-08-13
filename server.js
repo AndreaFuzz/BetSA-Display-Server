@@ -424,7 +424,7 @@ app.listen(PORT, () => {
   const diag = `http://localhost:${PORT}/diagnostic-ui`;
   redirectBrowser("1", `${diag}?screen=1`);
   redirectBrowser("2", `${diag}?screen=2`);
- 
+  autopatch.checkAndApply();
   const primary = detectPrimaryIPv4();
   const ip = primary && primary.ip;
   const minute = autopatch.startNightlyStagger(ip, { hour: 20, tz: "Africa/Johannesburg" });
