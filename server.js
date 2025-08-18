@@ -17,11 +17,12 @@ const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 const { captureScreenshot } = require("./screenshot");
 const { getLatestPatch } = require("./patch-info");
 const autopatch = require("./auto-patch");
+const { initScreenControllers } = require("./screen-map");
 
 const PORT = 8080;
 const STATE_FILE = "/home/admin/kiosk/urls.json";
 const POINTER_FILE = "/home/admin/kiosk/pointer.json";
-const SCREEN_PORT = { "1": 9222, "2": 9223 };
+ 
 const HUB = "http://10.1.220.219:7070";
 
 /* ---------------------------------------------------------------------- */
@@ -155,9 +156,15 @@ class DevToolsController {
     this.backoff = Math.min(this.backoff * 2, 60000);
   }
 }
-const controllers = {};
-for (const [id, port] of Object.entries(SCREEN_PORT)) controllers[id] = new DevToolsController(id, port);
-function redirectBrowser(id, url) { const c = controllers[id]; if (c) c.navigate(url); }
+// Build controllers so "1" always means left screen and "2" right screen.
+// Falls back to 9222/9223 if detection is not possible.
+const { redirectBrowser, getCurrentPorts } = initScreenControllers({
+  DevToolsController,
+  loadState,
+  env: { DISPLAY: process.env.DISPLAY || ":0", XAUTHORITY: process.env.XAUTHORITY || "/home/admin/.Xauthority" },
+  log: console,
+  pollMs: 5000,
+});
 
 /* ---------------------------------------------------------------------- */
 /* state helpers */
@@ -362,19 +369,27 @@ app.get("/autopatch/check", (req, res) => {
 
 /* live console logs over SSE (unchanged) */
 app.get("/console/:id?", (req, res) => {
+  const ports = getCurrentPorts(); // { "1": <port>, "2": <port> }
   const want = (() => {
     const id = req.params.id;
-    if (id === "1" || id === "2") return [[id, SCREEN_PORT[id]]];
-    return Object.entries(SCREEN_PORT);
+    if (id === "1" || id === "2") return [[id, ports[id]]];
+    return Object.entries(ports);
   })();
+
   res.writeHead(200, {
     "Content-Type":  "text/event-stream",
     "Cache-Control": "no-cache",
     Connection:      "keep-alive"
   });
   res.flushHeaders();
+
   const send = obj => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+
   function wire(screen, port) {
+    if (!port) {
+      send({ screen, kind: "error", text: "no port for screen" });
+      return;
+    }
     fetchJson(port)
       .then(list => {
         const page = list.find(t => t.type === "page");
@@ -382,39 +397,30 @@ app.get("/console/:id?", (req, res) => {
         const ws = new WebSocket(page.webSocketDebuggerUrl);
         let msgId = 0;
         const sendCmd = (method, params = {}) => ws.send(JSON.stringify({ id: ++msgId, method, params }));
-        ws.on("open", () => {
-          sendCmd("Runtime.enable");
-          sendCmd("Log.enable");
-        });
+        ws.on("open", () => { sendCmd("Runtime.enable"); sendCmd("Log.enable"); });
         ws.on("message", data => {
           try { data = JSON.parse(data); } catch { return; }
           if (data.method === "Runtime.consoleAPICalled") {
             const { type, args } = data.params;
-            send({
-              screen, kind: "console", type,
-              text: args.map(a => a.value ?? a.description).join(" "),
-              ts: Date.now()
-            });
+            send({ screen, kind: "console", type, text: args.map(a => a.value ?? a.description).join(" "), ts: Date.now() });
           }
           if (data.method === "Log.entryAdded") {
             const { entry } = data.params;
-            send({
-              screen, kind: "browser",
-              level: entry.level, source: entry.source, text: entry.text,
-              ts: entry.timestamp
-            });
+            send({ screen, kind: "browser", level: entry.level, source: entry.source, text: entry.text, ts: entry.timestamp });
           }
         });
-        ws.on("close",  () => send({ screen, kind: "status", text: "closed" }));
-        ws.on("error",  e => send({ screen, kind: "error",  text: e.message }));
+        ws.on("close", () => send({ screen, kind: "status", text: "closed" }));
+        ws.on("error", e => send({ screen, kind: "error", text: e.message }));
         req.on("close", () => ws.close());
       })
       .catch(err => { send({ screen, kind: "error", text: `connect failed: ${err.message}` }); });
   }
+
   want.forEach(([scr, port]) => wire(Number(scr), port));
   const ping = setInterval(() => res.write(": ping\n\n"), 30000);
   req.on("close", () => clearInterval(ping));
 });
+
 
 /* ---------------------------------------------------------------------- */
 /* start server */
