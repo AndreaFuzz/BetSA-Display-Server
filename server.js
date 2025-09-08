@@ -22,8 +22,27 @@ const { initScreenControllers } = require("./screen-map");
 const PORT = 8080;
 const STATE_FILE = "/home/admin/kiosk/urls.json";
 const POINTER_FILE = "/home/admin/kiosk/pointer.json";
- 
+const SCREEN_PORT = { "1": 9222, "2": 9223 };
 const HUB = "http://10.1.220.219:7070";
+const URLS_TS_FILE = "/home/admin/kiosk/urls.changed.json";
+
+/* urls-last-changed helpers */
+function loadUrlsChangedTs() {
+  try {
+    const raw = fs.readFileSync(URLS_TS_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.ts === "number") return obj.ts;
+  } catch {}
+  return null;
+}
+function bumpUrlsChangedTs() {
+  try {
+    fs.mkdirSync(path.dirname(URLS_TS_FILE), { recursive: true });
+    fs.writeFileSync(URLS_TS_FILE, JSON.stringify({ ts: Date.now() }, null, 2));
+  } catch (e) {
+    console.error("[urls-ts] persist failed:", e);
+  }
+}
 
 /* ---------------------------------------------------------------------- */
 /* fetch helper with timeout and jitter */
@@ -178,7 +197,7 @@ function saveState(s) {
     fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
   } catch (e) { console.error("Could not write state:", e); }
 }
-
+ 
 /* diagnostics helper */
 function getDiagnostics() {
   function detectModel() {
@@ -197,6 +216,7 @@ function getDiagnostics() {
     return "unknown";
   }
 
+  // External IPv4 interfaces
   const nets = os.networkInterfaces();
   const ifaces = [];
   for (const [n, arr] of Object.entries(nets)) {
@@ -207,15 +227,29 @@ function getDiagnostics() {
     }
   }
 
+  // Formats:
+  // - time: local (last_seen)
+  // - lastReboot: ISO string
+  // - urlsLastChanged: ISO string or null
+  const tz = { timeZone: "Africa/Johannesburg" };
+  const bootIso = new Date(Date.now() - os.uptime() * 1000).toISOString();
+  const urlsTs = loadUrlsChangedTs();
+  const urlsIso = urlsTs ? new Date(urlsTs).toISOString() : null;
+
   return {
-    time: new Date().toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }),
+    time: new Date().toLocaleString("en-ZA", tz),
     hostname: os.hostname(),
     arch: os.arch(),
     deviceModel: detectModel(),
     network: ifaces,
-    patch: getLatestPatch()
+    patch: getLatestPatch(),
+
+    // one-value ISO fields
+    lastReboot: bootIso,
+    urlsLastChanged: urlsIso
   };
 }
+
 
 /* ---------------------------------------------------------------------- */
 /* mouse helpers */
@@ -300,13 +334,35 @@ app.post("/saved-urls", (req, res) => {
   const { hdmi1, hdmi2 } = req.body || {};
   const ok = v => typeof v === "string" || v === null || typeof v === "undefined";
   if (!ok(hdmi1) || !ok(hdmi2)) return res.status(400).send("hdmi1/hdmi2 bad type");
+
   const state = loadState();
-  if (typeof hdmi1 !== "undefined") { state.hdmi1 = hdmi1; if (typeof hdmi1 === "string" && hdmi1) redirectBrowser("1", hdmi1); }
-  if (typeof hdmi2 !== "undefined") { state.hdmi2 = hdmi2; if (typeof hdmi2 === "string" && hdmi2) redirectBrowser("2", hdmi2); }
+  let changed = false;
+
+  if (typeof hdmi1 !== "undefined") {
+    if (hdmi1 !== state.hdmi1) changed = true;
+    state.hdmi1 = hdmi1;
+    if (typeof hdmi1 === "string" && hdmi1) redirectBrowser("1", hdmi1);
+  }
+  if (typeof hdmi2 !== "undefined") {
+    if (hdmi2 !== state.hdmi2) changed = true;
+    state.hdmi2 = hdmi2;
+    if (typeof hdmi2 === "string" && hdmi2) redirectBrowser("2", hdmi2);
+  }
+
   saveState(state);
-  announceUrls(state);
+
+  if (changed) {
+    bumpUrlsChangedTs();     // single timestamp for any URL change
+    announceUrls(state);     // keep your existing urls event
+    announceSelf();          // push fresh diagnostics (includes updated urlsLastChanged)
+  } else {
+    // maintain current behavior: still announce urls even if identical
+    announceUrls(state);
+  }
+
   res.json(state);
 });
+
 
 app.get("/mouse", (_, res) => res.json(loadPointerState()));
 app.post("/mouse", (req, res) => {
