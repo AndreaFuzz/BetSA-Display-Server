@@ -351,14 +351,11 @@ app.post("/saved-urls", (req, res) => {
 
   saveState(state);
 
-  if (changed) {
+   
     bumpUrlsChangedTs();     // single timestamp for any URL change
     announceUrls(state);     // keep your existing urls event
     announceSelf();          // push fresh diagnostics (includes updated urlsLastChanged)
-  } else {
-    // maintain current behavior: still announce urls even if identical
-    announceUrls(state);
-  }
+   
 
   res.json(state);
 });
