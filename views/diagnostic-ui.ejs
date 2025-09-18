@@ -10,24 +10,30 @@
     h1   {margin:0 0 0.4em 0;font-size:38px;}
     h2   {margin-top:0.8em;font-size:26px;}
 
-    /* same font size (22 px) but slimmer cells */
-    table {margin:0.6em auto;border-collapse:collapse;font-size:22px;}
-    td,th {border:1px solid #555;padding:0.25em 0.6em;}   /* tighter padding */
+    table {margin:0.6em auto;border-collapse:collapse;font-size:22px;min-width: 760px;}
+    td,th {border:1px solid #555;padding:0.25em 0.6em; text-align:left;}
     th    {background:#222;}
-
-    #countdown {margin-top:36px;text-align:center;font-size:24px;}
+    .badge {display:inline-block;margin-top:8px;padding:4px 10px;border-radius:12px;background:#243b55;}
+    .ok    {color:#a7f3d0;}
+    .warn  {color:#fbbf24;}
+    .err   {color:#f87171;}
+    .muted {color:#bbb;}
+    .mono  {font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>BetSA Device</h1>
-    <div>Version&nbsp;&nbsp;<%= version %></div>
+    <div>Version <%= version %></div>
+
+    <% if (screen === "1" || screen === "2") { %>
+      <div class="badge">Viewing Screen <%= screen %> (HDMI-<%= screen %>)</div>
+    <% } %>
 
     <div id="time"><%= d.time %></div>
-    <div>Hostname&nbsp;&nbsp;<%= d.hostname %></div>
-    <div>Arch&nbsp;&nbsp;<%= d.arch %></div>
-    <div>Model&nbsp;&nbsp;<%= d.deviceModel %></div>
-
+    <div>Hostname <%= d.hostname %></div>
+    <div>Arch <%= d.arch %></div>
+    <div>Model <%= d.deviceModel %></div>
     <h2>Network</h2>
     <table>
       <thead><tr><th>Interface</th><th>IP</th><th>MAC</th></tr></thead>
@@ -37,29 +43,58 @@
         <% }); %>
       </tbody>
     </table>
-
-    <% if (urls.hdmi1 || urls.hdmi2) { %>
-      <h2>Saved URLs</h2>
-      <table>
-        <thead><tr><th>Output</th><th>URL</th></tr></thead>
-        <tbody>
-          <% if (urls.hdmi1) { %>
-            <tr><td>HDMI-1</td><td style="word-break:break-all;"><%= urls.hdmi1 %></td></tr>
-          <% } %>
-          <% if (urls.hdmi2) { %>
-            <tr><td>HDMI-2</td><td style="word-break:break-all;"><%= urls.hdmi2 %></td></tr>
-          <% } %>
-        </tbody>
-      </table>
-    <% } %>
+    <h2>Displays</h2>
+    <%
+      function shortUrl(u){
+        if (!u) return "";
+        var s = String(u);
+        if (s.length <= 30) return s;
+        return "..." + s.slice(-30);
+      }
+    %>
+    <table>
+      <thead>
+        <tr>
+          <th>Port</th>
+          <th>Present</th>
+          <th>Status</th>
+          <th>Geometry</th>
+          <th>Saved URL (tail)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% 
+          const rows = [
+            { id: "1", name: "HDMI-1", url: (urls && urls.hdmi1) ? urls.hdmi1 : "" },
+            { id: "2", name: "HDMI-2", url: (urls && urls.hdmi2) ? urls.hdmi2 : "" },
+          ];
+          rows.forEach(function(r){
+            const h = d.hdmi && d.hdmi[r.name];
+            const present = h ? h.present : false;
+            const status  = h ? h.status  : "unavailable";
+            const geom    = (h && h.status === "connected" && typeof h.w === "number")
+                            ? (h.w + "x" + h.h + " +" + h.x + "," + h.y)
+                            : "—";
+            const statusCls = status === "connected" ? "ok" : (status === "disconnected" ? "warn" : "err");
+        %>
+          <tr>
+            <td><%= r.name %></td>
+            <td class="<%= present ? 'ok' : 'err' %>"><%= present ? 'yes' : 'no' %></td>
+            <td class="<%= statusCls %>"><%= status %></td>
+            <td class="muted"><%= geom %></td>
+            <td class="mono"><%= shortUrl(r.url) %></td>
+          </tr>
+        <% }); %>
+      </tbody>
+    </table>
 
     <% if (target) { %>
-      <div id="countdown">Redirecting in&nbsp;<span id="count">5</span>…</div>
+      <div id="countdown">Redirecting in <span id="count">5</span>...</div>
     <% } %>
   </div>
 
   <script>
-    /* live Johannesburg clock */
+    // live Johannesburg clock
     function updateTime(){
       document.getElementById('time').textContent =
         new Date().toLocaleString('en-ZA', {timeZone:'Africa/Johannesburg'});
@@ -67,13 +102,13 @@
     updateTime();
     setInterval(updateTime, 1000);
 
-    /* optional redirect countdown */
+    // optional redirect countdown
     <% if (target) { %>
       (function(){
-        let seconds = 5;
-        const span  = document.getElementById('count');
-        const url   = "<%= target %>";
-        const tick  = setInterval(() => {
+        var seconds = 5;
+        var span  = document.getElementById('count');
+        var url   = "<%= target %>";
+        var tick  = setInterval(function () {
           seconds--;
           span.textContent = seconds;
           if (seconds === 0) {

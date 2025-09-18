@@ -1,4 +1,4 @@
-// screenshot.js — truth-only screenshots with single-screen handling
+// screenshot.js — port-true screenshots: HDMI-1 -> screen 1, HDMI-2 -> screen 2
 "use strict";
 
 const fs = require("fs");
@@ -11,6 +11,10 @@ const DEFAULT_XAUTH   = "/home/admin/.Xauthority";
 const STATE_FILE      = "/home/admin/kiosk/urls.json";
 const SCALE_DIVISOR   = 2;
 
+// fixed port mapping by physical output
+const PORT_FOR = { "1": 9222, "2": 9223 };
+const OUT_FOR  = { "1": "HDMI-1", "2": "HDMI-2" };
+
 /* -------- exec helpers -------- */
 function run(cmd, opts = {}) {
   const env = { ...process.env, DISPLAY: process.env.DISPLAY || DEFAULT_DISPLAY, XAUTHORITY: process.env.XAUTHORITY || DEFAULT_XAUTH };
@@ -20,43 +24,51 @@ function run(cmd, opts = {}) {
 function have(cmd){ return !!run(`command -v ${cmd} || true`).trim(); }
 function safeUnlink(p){ try{ fs.unlinkSync(p); } catch{} }
 
-/* -------- layout helpers -------- */
-function parseHeads(){
+/* -------- layout / connection helpers -------- */
+function getOutputs() {
   const out = run("xrandr --query");
+  const con = {};
+  // quick status for HDMI-1/HDMI-2
+  for (const id of ["1","2"]) {
+    const name = OUT_FOR[id];
+    const re = new RegExp(`^${name}\\s+(connected|disconnected)`, "m");
+    const m = out.match(re);
+    con[id] = !!(m && m[1] === "connected");
+  }
+  // geometry map per *name*
+  const rx = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)\+(\d+)\+(\d+)/gm;
+  let m; const headsByName = {};
+  while ((m = rx.exec(out)) !== null) {
+    headsByName[m[1]] = { name:m[1], w:+m[2], h:+m[3], x:+m[4], y:+m[5] };
+  }
+  // total size (best-effort)
   const scr = out.match(/current\s+(\d+)\s+x\s+(\d+)/);
   const total = { W: scr ? +scr[1] : NaN, H: scr ? +scr[2] : NaN };
-  const rx = /^(HDMI-\d)\s+connected.*?(\d+)x(\d+)\+(\d+)\+(\d+)/gm;
-  let m; const heads=[];
-  while ((m = rx.exec(out)) !== null) heads.push({ name:m[1], w:+m[2], h:+m[3], x:+m[4], y:+m[5] });
-  heads.sort((a,b)=>a.x-b.x);
-  if (!heads.length) {
-    console.warn("[capture] xrandr parse failed; assuming single 1920x1080 at 0,0");
-    return { total:{W:1920,H:1080}, heads:[{ name:"HDMI-1", w:1920, h:1080, x:0, y:0 }] };
-  }
   if (!Number.isFinite(total.W) || !Number.isFinite(total.H)) {
-    const minX = Math.min(...heads.map(h=>h.x));
-    const maxX = Math.max(...heads.map(h=>h.x+h.w));
-    const minY = Math.min(...heads.map(h=>h.y));
-    const maxY = Math.max(...heads.map(h=>h.y+h.h));
-    total.W = maxX-minX; total.H = maxY-minY;
+    const heads = Object.values(headsByName);
+    if (heads.length) {
+      const minX = Math.min(...heads.map(h=>h.x));
+      const maxX = Math.max(...heads.map(h=>h.x+h.w));
+      const minY = Math.min(...heads.map(h=>h.y));
+      const maxY = Math.max(...heads.map(h=>h.y+h.h));
+      total.W = maxX-minX; total.H = maxY-minY;
+    } else {
+      total.W = 1920; total.H = 1080;
+    }
   }
-  return { total, heads };
+  return { connected: con, headsByName, total };
 }
-function geomForId(id, heads){
-  if (id === "1") return heads[0];
-  if (id === "2") {
-    if (heads.length < 2) return null; // IMPORTANT: no second head
-    return heads[1];
-  }
-  return null;
+function geomForId(id, headsByName) {
+  const name = OUT_FOR[id];
+  return headsByName[name] || null; // null if that physical output isn’t active
 }
 
-/* -------- expected URL helpers -------- */
+/* -------- expected URL helpers (unchanged) -------- */
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,"utf8")); } catch { return { hdmi1:null, hdmi2:null }; } }
 function expectedFor(id){ const s=loadState(); return id==="1"? s.hdmi1 : id==="2" ? s.hdmi2 : null; }
 function normalizeUrl(u){ if(!u) return ""; try { return new URL(u).href; } catch { return String(u); } }
 
-/* -------- DevTools mapping (no wmctrl) -------- */
+/* -------- DevTools helpers -------- */
 function fetchJson(port){
   return new Promise((res,rej)=>{
     http.get({host:"127.0.0.1", port, path:"/json"}, r=>{
@@ -64,52 +76,14 @@ function fetchJson(port){
     }).on("error",rej);
   });
 }
-async function cdpWindowRectForPort(port){
-  const list = await fetchJson(port);
-  const page = list.find(t=>t.type==="page");
-  if (!page) throw new Error("no page target");
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve,reject)=>{
-    const t=setTimeout(()=>reject(new Error("ws open timeout")),3000);
-    ws.once("open",()=>{ clearTimeout(t); resolve(); });
-    ws.once("error",reject);
-  });
-  const rect = await new Promise((resolve,reject)=>{
-    ws.once("message",(raw)=>{
-      try{
-        const msg=JSON.parse(raw);
-        if (msg.id===1 && msg.result && msg.result.result && msg.result.result.value) {
-          resolve(msg.result.result.value);
-        }
-      }catch(e){ reject(e); }
-    });
-    ws.send(JSON.stringify({
-      id:1, method:"Runtime.evaluate",
-      params:{ expression:"({x:window.screenX,y:window.screenY,w:window.outerWidth,h:window.outerHeight})", returnByValue:true }
-    }));
-  }).finally(()=>ws.close());
-  if (!rect || typeof rect.x !== "number") throw new Error("no rect from page");
-  return { x:Number(rect.x)||0, y:Number(rect.y)||0, w:Number(rect.w)||0, h:Number(rect.h)||0 };
-}
-async function detectLeftRightPortsCDP(){
-  const ports=[9222,9223];
-  const out=[];
-  for (const p of ports) {
-    try { const r=await cdpWindowRectForPort(p); out.push({port:p, x:r.x, rect:r}); } catch {}
-  }
-  if (!out.length) return null;
-  out.sort((a,b)=>a.x-b.x);
-  return { left: out[0].port, right: out[1] ? out[1].port : null, details: out };
-}
 
-/* -------- DevTools truth-only capture -------- */
+/* -------- DevTools capture bound to fixed port -------- */
 async function captureViaDevtoolsTruth(screenId, quality){
-  const map = await detectLeftRightPortsCDP();
-  if (!map) throw new Error("devtools map unavailable");
-  if (screenId === "2" && !map.right) throw new Error("screen 2 not available");
+  const { connected } = getOutputs();
+  if (screenId === "1" && !connected["1"]) throw new Error("screen 1 not connected");
+  if (screenId === "2" && !connected["2"]) throw new Error("screen 2 not connected");
 
-  const port = (screenId === "1") ? map.left : map.right;
-
+  const port = PORT_FOR[screenId];
   const list = await fetchJson(port);
   const page = list.find(t=>t.type==="page");
   if (!page) throw new Error("no page target");
@@ -130,9 +104,7 @@ async function captureViaDevtoolsTruth(screenId, quality){
   ws.on("message",(raw)=>{
     try{
       const msg=JSON.parse(raw);
-      if (msg.id && pending.has(msg.id)) {
-        pending.get(msg.id).resolve(msg.result); pending.delete(msg.id);
-      }
+      if (msg.id && pending.has(msg.id)) { pending.get(msg.id).resolve(msg.result); pending.delete(msg.id); }
     }catch{}
   });
 
@@ -156,18 +128,17 @@ async function captureViaDevtoolsTruth(screenId, quality){
   return await scaleMemoryToJpeg(buf, quality);
 }
 
-/* -------- X11 full-desktop + crop (truth) -------- */
+/* -------- X11 full-desktop + crop by output name -------- */
 async function captureViaX11FullCrop(screenId, quality){
   if (!have("ffmpeg")) throw new Error("ffmpeg not available");
-  const { total, heads } = parseHeads();
-  const g = geomForId(screenId, heads);
-  if (!g) {
-    if (screenId === "2") throw new Error("screen 2 not connected");
-    throw new Error("invalid id");
-  }
+  const { total, headsByName, connected } = getOutputs();
+  if (screenId === "1" && !connected["1"]) throw new Error("screen 1 not connected");
+  if (screenId === "2" && !connected["2"]) throw new Error("screen 2 not connected");
 
-  const W = total.W || heads.reduce((s,h)=>s+h.w,0);
-  const H = total.H || Math.max(...heads.map(h=>h.h));
+  const g = geomForId(screenId, headsByName);
+  if (!g) throw new Error(`screen ${screenId} not connected`);
+
+  const W = total.W, H = total.H;
   const display = (process.env.DISPLAY || DEFAULT_DISPLAY).includes(".")
     ? (process.env.DISPLAY || DEFAULT_DISPLAY)
     : (process.env.DISPLAY || DEFAULT_DISPLAY) + ".0";
@@ -191,7 +162,7 @@ async function captureScreenshot(id, quality = 70){
   throw new Error("screenshot failed: all methods exhausted");
 }
 
-/* -------- scaling/compression -------- */
+/* -------- scaling/compression (unchanged) -------- */
 let _sharpTried=false, _sharp=null;
 function tryLoadSharp(){ if(_sharpTried) return _sharp; _sharpTried=true; try{ _sharp=require("sharp"); }catch(e){ console.warn("[compress] sharp not available:", e.message); _sharp=null; } return _sharp; }
 function mapJpegQualityToFfmpegQ(q){ const v=Math.round(31 - Math.max(1,Math.min(100,q))*(29/100)); return Math.max(2,Math.min(31,v)); }

@@ -18,7 +18,7 @@ const { captureScreenshot } = require("./screenshot");
 const { getLatestPatch } = require("./patch-info");
 const autopatch = require("./auto-patch");
 const { initScreenControllers } = require("./screen-map");
-
+const { HdmiBrowserSupervisor, stopBrowsersServiceNow } = require("./hdmiBrowsersHelper");
 const PORT = 8080;
 const STATE_FILE = "/home/admin/kiosk/urls.json";
 const POINTER_FILE = "/home/admin/kiosk/pointer.json";
@@ -197,6 +197,50 @@ function saveState(s) {
     fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
   } catch (e) { console.error("Could not write state:", e); }
 }
+ // --- HDMI status helpers (port-true by connector name) ---
+function _runXR(cmd) {
+  try {
+    const env = {
+      ...process.env,
+      DISPLAY: process.env.DISPLAY || ":0",
+      XAUTHORITY: process.env.XAUTHORITY || "/home/admin/.Xauthority",
+    };
+    return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env }).toString();
+  } catch {
+    return "";
+  }
+}
+
+// Returns an object like:
+// {
+//   "HDMI-1": { present:true, status:"connected"|"disconnected", w:1920, h:1080, x:0, y:0 },
+//   "HDMI-2": { present:false, status:"unavailable" }   // if connector not exposed by GPU
+// }
+function getHdmiStatus() {
+  const xr = _runXR("xrandr --query");
+  const want = ["HDMI-1", "HDMI-2"];
+  const map = {};
+
+  for (const name of want) {
+    const line = xr.match(new RegExp(`^${name}\\s+(connected|disconnected)\\b(.*)$`, "m"));
+    if (!line) {
+      // The connector name is not present at all in xrandr output
+      map[name] = { present: false, status: "unavailable" };
+      continue;
+    }
+    const status = line[1];
+    const tail = line[2] || "";
+    let w, h, x, y;
+    const g = tail.match(/(\d{2,5})x(\d{2,5})\+(\d{1,5})\+(\d{1,5})/);
+    if (g) { w = +g[1]; h = +g[2]; x = +g[3]; y = +g[4]; }
+    map[name] = {
+      present: true,
+      status,
+      ...(status === "connected" && Number.isFinite(w) ? { w, h, x, y } : {})
+    };
+  }
+  return map;
+}
  
 /* diagnostics helper */
 function getDiagnostics() {
@@ -227,14 +271,14 @@ function getDiagnostics() {
     }
   }
 
-  // Formats:
-  // - time: local (last_seen)
-  // - lastReboot: ISO string
-  // - urlsLastChanged: ISO string or null
+  // Time/meta
   const tz = { timeZone: "Africa/Johannesburg" };
   const bootIso = new Date(Date.now() - os.uptime() * 1000).toISOString();
   const urlsTs = loadUrlsChangedTs();
   const urlsIso = urlsTs ? new Date(urlsTs).toISOString() : null;
+
+  // HDMI ports status (from xrandr)
+  const hdmi = getHdmiStatus(); // { "HDMI-1": {...}, "HDMI-2": {...} }
 
   return {
     time: new Date().toLocaleString("en-ZA", tz),
@@ -244,11 +288,15 @@ function getDiagnostics() {
     network: ifaces,
     patch: getLatestPatch(),
 
-    // one-value ISO fields
     lastReboot: bootIso,
-    urlsLastChanged: urlsIso
+    urlsLastChanged: urlsIso,
+
+    // only this for displays
+    hdmi
   };
 }
+
+
 
 
 /* ---------------------------------------------------------------------- */
@@ -477,18 +525,35 @@ app.get("/console/:id?", (req, res) => {
 
 /* ---------------------------------------------------------------------- */
 /* start server */
-app.listen(PORT, () => {
-  console.log(`kiosk-server listening on ${PORT}`);
-  
+/* ---------------------------------------------------------------------- */
+ 
+app.listen(PORT, async () => {
+ console.log(`kiosk-server listening on ${PORT}`);
+
+  // Fire-and-forget: do not await (or set graceMs:0 to return immediately even if you await)
+  stopBrowsersServiceNow("betsa-browsers.service");
+
+  const sup = new HdmiBrowserSupervisor({ desktopUser: "admin", display: ":0" });
+
+  // Run supervisor in the background so your app keeps serving and reacts to hot-plug
+  sup.start().catch(err => console.error("[supervisor] crashed:", err));
+   
+
+  // continue with your other tasks immediately
   const diag = `http://localhost:${PORT}/diagnostic-ui`;
-  redirectBrowser("1", `${diag}?screen=1`);
-  redirectBrowser("2", `${diag}?screen=2`);
+  // give Chromium a moment to come up and create a Page target
+  setTimeout(() => {
+    redirectBrowser("1", `${diag}?screen=1`);
+    redirectBrowser("2", `${diag}?screen=2`);
+  }, 2000);
+
   autopatch.checkAndApply();
+
   const primary = detectPrimaryIPv4();
   const ip = primary && primary.ip;
   const minute = autopatch.startNightlyStagger(ip, { hour: 20, tz: "Africa/Johannesburg" });
   console.log(`[autopatch] stagger minute for ${ip || "unknown"}: ${minute}`);
-  
-  announceSelf(); // announce immediately
-  setInterval(announceSelf, ANNOUNCE_INTERVAL); // keep drift
+
+  announceSelf();
+  setInterval(announceSelf, ANNOUNCE_INTERVAL);
 });

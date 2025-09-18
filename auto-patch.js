@@ -307,13 +307,6 @@ function isBusy() {
   return !!activeRun;
 }
 
-// Optional periodic mode, if you ever want it:
-// function start() {
-//   checkAndApply();
-//   const ms = Number(process.env.AUTOPATCH_INTERVAL_MS || 6 * 60 * 60 * 1000);
-//   setInterval(checkAndApply, ms);
-// }
-
 
 
 /* -------------------------------------------------------------------------- */
