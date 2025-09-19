@@ -12,6 +12,7 @@ const { execSync, spawn } = require("child_process");
 const os = require("os");
 const path = require("path");
 const http = require("http");
+const rebootGuard = require("./reboot-guard");
 const WebSocket = require("ws");
 const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 const { captureScreenshot } = require("./screenshot");
@@ -372,10 +373,7 @@ app.get("/diagnostic-ui", (req, res) => {
   });
 });
 
-app.post("/reboot", (_req, res) => {
-  res.send("Rebooting...");
-  setTimeout(() => spawn("sudo", ["reboot"], { stdio: "ignore", detached: true }).unref(), 100);
-});
+app.post("/reboot", rebootGuard.handleRebootBlocking);
 
 app.get("/saved-urls", (_, res) => res.json(loadState()));
 app.post("/saved-urls", (req, res) => {
@@ -534,8 +532,7 @@ app.listen(PORT, async () => {
   stopBrowsersServiceNow("betsa-browsers.service");
 
   const sup = new HdmiBrowserSupervisor({ desktopUser: "admin", display: ":0" });
-
-  // Run supervisor in the background so your app keeps serving and reacts to hot-plug
+  console.log("[supervisor] starting background loop");
   sup.start().catch(err => console.error("[supervisor] crashed:", err));
    
 
