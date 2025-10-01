@@ -258,7 +258,14 @@ async function _doCheckAndApply(opts = {}) {
   const current = typeof local.patch === "number" ? local.patch : 0;
   console.log(`[autopatch] current patch: ${current}`);
 
-  const patches = await getServerPatches();
+  let patches;
+  try {
+    patches = await getServerPatches();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error(`[autopatch] failed to fetch patch manifest: ${msg}`);
+    return { current, latest: current, applied: [], error: msg };
+  }
   const latest = patches.reduce(
     (m, p) => Math.max(m, Number(p.number) || 0),
     0
