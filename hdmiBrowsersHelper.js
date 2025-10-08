@@ -225,11 +225,13 @@ async start() {
   if (this._running) return;
   this._running = true; this._stopping = false;
 
-  if (!fs.existsSync(this.cfg.browser)) {
-    console.error("Chromium not found. Set browserPath in options.");
-    this._running = false;
-    throw new Error("browser not found");
+  // NEW (non-fatal: idle + retry forever)
+  while (!fs.existsSync(this.cfg.browser) && !this._stopping) {
+    console.warn("[supervisor] Chromium not found at", this.cfg.browser, "- will retry in 30s");
+    await sleep(30000);
   }
+  // if we were told to stop while waiting, just exit cleanly
+  if (this._stopping) { this._running = false; return; }
 
   this.ensureDbusSession();
   this.applyXmodmap();
